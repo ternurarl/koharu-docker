@@ -14,7 +14,7 @@ without pulling in Tauri, CEF, GTK, or a window server.
   - gui (default): the desktop app (unchanged behavior).
   - headless: compiles the server path; skips tauri-build, the frontend embed,
     and the CEF entrypoint entirely.
-- CLI: koharu --headless [--host 0.0.0.0] [--port 4000] [--data DIR] [--cpu].
+- CLI: koharu --headless [--host 0.0.0.0] [--port 4000] [--data DIR] [--cpu|--gpu].
 
 ## Build (Docker)
 
@@ -29,19 +29,37 @@ without pulling in Tauri, CEF, GTK, or a window server.
 
     docker run --rm -p 4000:4000 \
       --security-opt seccomp=unconfined \
+      --device /dev/dri \
       -v koharu-data:/home/koharu/.local/share/Koharu \
       koharu-headless
 
-The default CMD runs CPU-only (--cpu): it initializes only Torch and skips
-llama.cpp / stable-diffusion.cpp, for remote-provider translation without a
-GPU. On a Vulkan-GPU host, drop --cpu:
+The default CMD runs iGPU mode (--gpu): it initializes Torch +
+stable-diffusion.cpp so the Intel UHD 630 (or any Vulkan-capable GPU) can do
+inpainting, while llama.cpp stays uninitialized and translation must use a
+remote provider. The container needs --device /dev/dri to see the iGPU.
+
+The three modes are:
+
+- --cpu: Torch only; inpainting uses the Torch-backed LaMa model; no Vulkan
+  GPU required.
+- --gpu (default CMD): Torch + stable-diffusion.cpp for iGPU inpainting on a
+  Vulkan-capable GPU, skipping llama.cpp (translation is remote).
+- neither flag: full mode - additionally initializes llama.cpp for local LLM
+  translation on a Vulkan GPU.
+
+Run a GPU-less host with --cpu explicitly:
 
     docker run --rm -p 4000:4000 \
       --security-opt seccomp=unconfined \
       -v koharu-data:/home/koharu/.local/share/Koharu \
-      koharu-headless --host 0.0.0.0 --port 4000
+      koharu-headless --host 0.0.0.0 --port 4000 --cpu
 
 Notes:
+- Intel iGPU hosts need the Mesa ANV Vulkan driver: the runtime image installs
+  mesa-vulkan-drivers + libvulkan1. Pass --device /dev/dri (and give the
+  container access to /dev/dri/renderD*) so stable-diffusion.cpp can open the
+  device. On bare metal, the distro needs the same packages and the render
+  group membership.
 - --data defaults to the platform data dir + "Koharu"
   (~/.local/share/Koharu on Linux). Projects live under data/projects, model
   packages under data/packages.
@@ -49,11 +67,11 @@ Notes:
 - seccomp=unconfined is required because koharu-secrets stores provider API
   keys in the Linux keyutils keyring (keyctl/add_key). Without it, provider
   secret endpoints fail with "failed to initialize Linux Keyutils".
-- CPU-only (default): translation must use a remote provider (llama.cpp is
-  not initialized); inpainting uses the Torch-backed LaMa model; rendered PNG
+- --cpu: translation must use a remote provider (llama.cpp is not
+  initialized); inpainting uses the Torch-backed LaMa model; rendered PNG
   export needs a GPU while source export works. On first run the CPU LibTorch
   wheel is downloaded into data/packages.
-- Full mode (drop --cpu): additionally downloads Vulkan-only llama.cpp /
+- Full mode (neither flag): additionally downloads Vulkan-only llama.cpp /
   stable-diffusion.cpp assets and enables local LLM translation on a Vulkan GPU.
 
 ## REST API (all under /api/v1)

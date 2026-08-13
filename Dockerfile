@@ -5,6 +5,7 @@
 #   docker build -t koharu-headless .
 #   docker run --rm -p 4000:4000 \
 #     --security-opt seccomp=unconfined \
+#     --device /dev/dri \
 #     -v koharu-data:/home/koharu/.local/share/Koharu \
 #     koharu-headless
 #
@@ -13,6 +14,8 @@
 # runtime downloads Vulkan-only llama.cpp / stable-diffusion.cpp assets; the
 # build downloads the CPU LibTorch wheel, so a GPU-less container runs
 # detection/OCR on CPU and remote-provider translation works out of the box.
+# The default CMD enables the iGPU mode (--gpu), so pass --device /dev/dri to
+# expose the Intel ANV Vulkan driver to stable-diffusion.cpp inpainting.
 
 FROM ubuntu:24.04 AS builder
 ARG DEBIAN_FRONTEND=noninteractive
@@ -51,6 +54,7 @@ ARG DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates curl libssl3 libgomp1 libfontconfig1 fonts-noto-cjk \
+        mesa-vulkan-drivers libvulkan1 \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --create-home --shell /bin/bash koharu \
     && install -d -o koharu -g koharu -m 755 /home/koharu/.local/share/Koharu
@@ -68,4 +72,7 @@ VOLUME ["/home/koharu/.local/share/Koharu"]
 EXPOSE 4000
 
 ENTRYPOINT ["/usr/local/bin/koharu", "--headless"]
-CMD ["--host", "0.0.0.0", "--port", "4000", "--cpu"]
+# mesa-vulkan-drivers provides the Intel ANV Vulkan driver; the container
+# still needs --device /dev/dri (and /dev/dri/renderD* permissions) to see
+# the iGPU. Use --cpu instead of --gpu for a GPU-less host.
+CMD ["--host", "0.0.0.0", "--port", "4000", "--gpu"]

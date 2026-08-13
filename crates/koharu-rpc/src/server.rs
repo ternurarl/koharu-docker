@@ -13,8 +13,10 @@ use crate::state::App;
 /// host/port are the bind address; data is the persistent root (projects +
 /// model packages), defaulting to the platform data dir + "Koharu". cpu
 /// forces CPU inference and initializes only Torch, skipping llama.cpp and
-/// stable-diffusion.cpp (for remote-provider translation without a GPU).
-pub async fn serve(host: &str, port: u16, data: Option<PathBuf>, cpu: bool) -> Result<()> {
+/// stable-diffusion.cpp (for remote-provider translation without a GPU);
+/// gpu initializes Torch + stable-diffusion for iGPU inpainting while still
+/// skipping llama.cpp. With neither flag the full ML runtime is initialized.
+pub async fn serve(host: &str, port: u16, data: Option<PathBuf>, cpu: bool, gpu: bool) -> Result<()> {
     let data_dir = data.unwrap_or_else(|| {
         dirs::data_local_dir()
             .unwrap_or_else(|| PathBuf::from("."))
@@ -31,6 +33,10 @@ pub async fn serve(host: &str, port: u16, data: Option<PathBuf>, cpu: bool) -> R
         koharu_ml::init_cpu()
             .await
             .context("failed to initialize the CPU ML runtime")?;
+    } else if gpu {
+        koharu_ml::init_gpu()
+            .await
+            .context("failed to initialize the GPU ML runtime")?;
     } else {
         koharu_ml::init()
             .await

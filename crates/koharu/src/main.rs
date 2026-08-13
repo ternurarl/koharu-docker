@@ -31,6 +31,11 @@ struct Cli {
     /// for remote-provider translation without a GPU.
     #[arg(long)]
     cpu: bool,
+
+    /// Initialize Torch + stable-diffusion for iGPU inpainting, skipping
+    /// llama.cpp (remote-provider translation).
+    #[arg(long)]
+    gpu: bool,
 }
 
 #[tokio::main]
@@ -57,7 +62,7 @@ async fn main() {
 
 #[cfg(feature = "headless")]
 async fn run_headless(cli: Cli) {
-    if let Err(error) = koharu_rpc::serve(&cli.host, cli.port, cli.data, cli.cpu).await {
+    if let Err(error) = koharu_rpc::serve(&cli.host, cli.port, cli.data, cli.cpu, cli.gpu).await {
         tracing::error!("headless server failed: {error:#}");
         std::process::exit(1);
     }

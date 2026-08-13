@@ -74,6 +74,13 @@ pub async fn init_cpu() -> anyhow::Result<()> {
     init_features(vec![Feature::Torch]).await
 }
 
+/// Initializes Torch + stable-diffusion for iGPU inpainting, skipping
+/// llama.cpp (translation is remote).
+#[tracing::instrument(skip_all)]
+pub async fn init_gpu() -> anyhow::Result<()> {
+    init_features(vec![Feature::Torch, Feature::Diffusion]).await
+}
+
 async fn init_features(features: Vec<Feature>) -> anyhow::Result<()> {
     READY
         .get_or_try_init(move || async move {
