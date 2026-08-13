@@ -1,0 +1,10 @@
+target
+.git
+.github
+node_modules
+packages/*/node_modules
+packages/*/out
+packages/*/.next
+docs
+*.md
+!README.md

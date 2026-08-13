@@ -20,6 +20,7 @@ pub fn install() {
             client.flush(Some(Duration::from_secs(2)));
         }
 
+        #[cfg(feature = "gui")]
         rfd::MessageDialog::new()
             .set_level(rfd::MessageLevel::Error)
             .set_title("Koharu has stopped")
@@ -28,6 +29,9 @@ pub fn install() {
             ))
             .set_buttons(rfd::MessageButtons::Ok)
             .show();
+
+        #[cfg(not(feature = "gui"))]
+        eprintln!("Koharu has stopped: {msg}\n\nat {location}");
 
         std::process::exit(1);
     }));

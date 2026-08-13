@@ -13,24 +13,37 @@ publish.workspace = true
 license.workspace = true
 
 [features]
-default = ["tauri/cef"]
+default = ["gui"]
+gui = [
+    "dep:tauri",
+    "dep:koharu-app",
+    "dep:koharu-desktop",
+    "dep:rfd",
+    "dep:tauri-plugin-opener",
+    "dep:tauri-plugin-process",
+    "dep:tauri-plugin-updater",
+    "dep:tauri-build",
+    "tauri/cef",
+]
+headless = ["dep:koharu-rpc"]
 
 [dependencies]
 clap = { workspace = true }
 console = { workspace = true }
-koharu-app = { workspace = true }
-koharu-desktop = { workspace = true }
+koharu-app = { workspace = true, optional = true }
+koharu-desktop = { workspace = true, optional = true }
+koharu-rpc = { workspace = true, optional = true }
 koharu-torch-sys = { workspace = true }
-rfd = { workspace = true }
+rfd = { workspace = true, optional = true }
 sentry = { workspace = true }
 serde_json = { workspace = true }
-tauri = { workspace = true }
-tauri-plugin-opener = { workspace = true }
-tauri-plugin-process = { workspace = true }
-tauri-plugin-updater = { workspace = true }
+tauri = { workspace = true, optional = true }
+tauri-plugin-opener = { workspace = true, optional = true }
+tauri-plugin-process = { workspace = true, optional = true }
+tauri-plugin-updater = { workspace = true, optional = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [build-dependencies]
-tauri-build = { workspace = true }
+tauri-build = { workspace = true, optional = true }
