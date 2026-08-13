@@ -12,7 +12,8 @@ use crate::state::App;
 ///
 /// host/port are the bind address; data is the persistent root (projects +
 /// model packages), defaulting to the platform data dir + "Koharu". cpu
-/// forces CPU inference.
+/// forces CPU inference and initializes only Torch, skipping llama.cpp and
+/// stable-diffusion.cpp (for remote-provider translation without a GPU).
 pub async fn serve(host: &str, port: u16, data: Option<PathBuf>, cpu: bool) -> Result<()> {
     let data_dir = data.unwrap_or_else(|| {
         dirs::data_local_dir()
@@ -26,9 +27,15 @@ pub async fn serve(host: &str, port: u16, data: Option<PathBuf>, cpu: bool) -> R
     // data directory so it can be persisted as a volume.
     koharu_runtime::Store::configure(data_dir.join("packages"))?;
 
-    koharu_ml::init()
-        .await
-        .context("failed to initialize the ML runtime")?;
+    if cpu {
+        koharu_ml::init_cpu()
+            .await
+            .context("failed to initialize the CPU ML runtime")?;
+    } else {
+        koharu_ml::init()
+            .await
+            .context("failed to initialize the ML runtime")?;
+    }
     let device = koharu_ml::device(cpu);
 
     tracing::info!(

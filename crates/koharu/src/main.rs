@@ -27,7 +27,8 @@ struct Cli {
     #[arg(long)]
     data: Option<std::path::PathBuf>,
 
-    /// Force CPU inference, ignoring any discovered accelerator.
+    /// CPU-only mode: initialize only Torch (skip llama.cpp / stable-diffusion),
+    /// for remote-provider translation without a GPU.
     #[arg(long)]
     cpu: bool,
 }
@@ -57,7 +58,7 @@ async fn main() {
 #[cfg(feature = "headless")]
 async fn run_headless(cli: Cli) {
     if let Err(error) = koharu_rpc::serve(&cli.host, cli.port, cli.data, cli.cpu).await {
-        tracing::error!(%error, "headless server failed");
+        tracing::error!("headless server failed: {error:#}");
         std::process::exit(1);
     }
 }

@@ -32,6 +32,15 @@ without pulling in Tauri, CEF, GTK, or a window server.
       -v koharu-data:/home/koharu/.local/share/Koharu \
       koharu-headless
 
+The default CMD runs CPU-only (--cpu): it initializes only Torch and skips
+llama.cpp / stable-diffusion.cpp, for remote-provider translation without a
+GPU. On a Vulkan-GPU host, drop --cpu:
+
+    docker run --rm -p 4000:4000 \
+      --security-opt seccomp=unconfined \
+      -v koharu-data:/home/koharu/.local/share/Koharu \
+      koharu-headless --host 0.0.0.0 --port 4000
+
 Notes:
 - --data defaults to the platform data dir + "Koharu"
   (~/.local/share/Koharu on Linux). Projects live under data/projects, model
@@ -40,10 +49,12 @@ Notes:
 - seccomp=unconfined is required because koharu-secrets stores provider API
   keys in the Linux keyutils keyring (keyctl/add_key). Without it, provider
   secret endpoints fail with "failed to initialize Linux Keyutils".
-- On first run the runtime downloads the CPU LibTorch wheel and (Vulkan-only)
-  llama.cpp / stable-diffusion.cpp assets into data/packages. Local LLM
-  translation and PNG export therefore require a Vulkan GPU; detection/OCR run
-  on CPU, and remote-provider translation works without a GPU.
+- CPU-only (default): translation must use a remote provider (llama.cpp is
+  not initialized); inpainting uses the Torch-backed LaMa model; rendered PNG
+  export needs a GPU while source export works. On first run the CPU LibTorch
+  wheel is downloaded into data/packages.
+- Full mode (drop --cpu): additionally downloads Vulkan-only llama.cpp /
+  stable-diffusion.cpp assets and enables local LLM translation on a Vulkan GPU.
 
 ## REST API (all under /api/v1)
 

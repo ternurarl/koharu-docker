@@ -62,28 +62,45 @@ static READY: OnceCell<Device> = OnceCell::const_new();
 /// deterministic, single-attempt API.
 #[tracing::instrument(skip_all)]
 pub async fn init() -> anyhow::Result<()> {
+    init_features(vec![Feature::Torch, Feature::Llama, Feature::Diffusion]).await
+}
+
+/// Initializes only the CPU-capable Torch backend, skipping llama.cpp and
+/// stable-diffusion.cpp. Use for headless servers that translate through
+/// remote providers and inpaint with Torch-only models, so no Vulkan GPU is
+/// required.
+#[tracing::instrument(skip_all)]
+pub async fn init_cpu() -> anyhow::Result<()> {
+    init_features(vec![Feature::Torch]).await
+}
+
+async fn init_features(features: Vec<Feature>) -> anyhow::Result<()> {
     READY
-        .get_or_try_init(|| async {
-            let runtime = Runtime::discover([Feature::Torch, Feature::Llama, Feature::Diffusion])?;
+        .get_or_try_init(move || async move {
+            let runtime = Runtime::discover(features.iter().copied())?;
             let device = runtime.device().cloned().unwrap_or_else(Device::cpu);
             runtime
                 .initialize()
                 .await
                 .context("failed to initialize runtimes")?;
 
-            LLAMA
-                .get_or_try_init(|| async {
-                    koharu_llama::send_logs_to_tracing(koharu_llama::LogOptions::default());
-                    LlamaBackend::init().context("failed to initialize llama.cpp backend")
-                })
-                .await?;
-            DIFFUSION
-                .get_or_try_init(|| async {
-                    koharu_diffusion::send_logs_to_tracing()
-                        .context("failed to redirect stable-diffusion.cpp logs")?;
-                    Ok::<(), anyhow::Error>(())
-                })
-                .await?;
+            if features.contains(&Feature::Llama) {
+                LLAMA
+                    .get_or_try_init(|| async {
+                        koharu_llama::send_logs_to_tracing(koharu_llama::LogOptions::default());
+                        LlamaBackend::init().context("failed to initialize llama.cpp backend")
+                    })
+                    .await?;
+            }
+            if features.contains(&Feature::Diffusion) {
+                DIFFUSION
+                    .get_or_try_init(|| async {
+                        koharu_diffusion::send_logs_to_tracing()
+                            .context("failed to redirect stable-diffusion.cpp logs")?;
+                        Ok::<(), anyhow::Error>(())
+                    })
+                    .await?;
+            }
             Ok::<Device, anyhow::Error>(device)
         })
         .await?;

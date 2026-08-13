@@ -40,7 +40,10 @@ COPY . .
 RUN --mount=type=cache,target=/root/.cache/koharu \
     --mount=type=cache,target=/opt/cargo/registry \
     --mount=type=cache,target=/app/target \
-    cargo build -p koharu --release --locked --no-default-features --features headless
+    cargo build -p koharu --release --locked --no-default-features --features headless \
+    && mkdir -p /out \
+    && cp /app/target/release/koharu /out/koharu \
+    && cp /app/target/release/libkoharu-torch.so /out/libkoharu-torch.so
 
 FROM ubuntu:24.04 AS runtime
 ARG DEBIAN_FRONTEND=noninteractive
@@ -52,8 +55,8 @@ RUN apt-get update \
     && useradd --create-home --shell /bin/bash koharu \
     && install -d -o koharu -g koharu -m 755 /home/koharu/.local/share/Koharu
 
-COPY --from=builder /app/target/release/koharu /usr/local/bin/koharu
-COPY --from=builder /app/target/release/libkoharu-torch.so /usr/local/lib/libkoharu-torch.so
+COPY --from=builder /out/koharu /usr/local/bin/koharu
+COPY --from=builder /out/libkoharu-torch.so /usr/local/lib/libkoharu-torch.so
 RUN ldconfig
 
 USER koharu
@@ -64,4 +67,5 @@ ENV XDG_CACHE_HOME=/home/koharu/.cache
 VOLUME ["/home/koharu/.local/share/Koharu"]
 EXPOSE 4000
 
-CMD ["/usr/local/bin/koharu", "--headless", "--host", "0.0.0.0", "--port", "4000"]
+ENTRYPOINT ["/usr/local/bin/koharu", "--headless"]
+CMD ["--host", "0.0.0.0", "--port", "4000", "--cpu"]
