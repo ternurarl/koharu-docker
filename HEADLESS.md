@@ -31,6 +31,7 @@ without pulling in Tauri, CEF, GTK, or a window server.
       --security-opt seccomp=unconfined \
       --device /dev/dri \
       -v koharu-data:/home/koharu/.local/share/Koharu \
+      -v koharu-config:/home/koharu/.koharu \
       koharu-headless
 
 The default CMD runs iGPU mode (--gpu): it initializes Torch +
@@ -52,6 +53,7 @@ Run a GPU-less host with --cpu explicitly:
     docker run --rm -p 4000:4000 \
       --security-opt seccomp=unconfined \
       -v koharu-data:/home/koharu/.local/share/Koharu \
+      -v koharu-config:/home/koharu/.koharu \
       koharu-headless --host 0.0.0.0 --port 4000 --cpu
 
 Notes:
@@ -63,7 +65,10 @@ Notes:
 - --data defaults to the platform data dir + "Koharu"
   (~/.local/share/Koharu on Linux). Projects live under data/projects, model
   packages under data/packages.
-- Configuration stays at ~/.koharu/config.toml (koharu_config).
+- Configuration stays at ~/.koharu/config.toml (koharu_config), which is
+  outside the data volume: mount koharu-config:/home/koharu/.koharu or a
+  container recreation resets all config to defaults. Provider secrets live
+  in the Linux keyring and are lost on every restart regardless.
 - seccomp=unconfined is required because koharu-secrets stores provider API
   keys in the Linux keyutils keyring (keyctl/add_key). Without it, provider
   secret endpoints fail with "failed to initialize Linux Keyutils".
