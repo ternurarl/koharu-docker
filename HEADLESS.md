@@ -89,7 +89,8 @@ Notes:
 - POST /projects/current/export           -> { pages?, format: "rendered"|"source" }
 - GET  /pages/{id}/thumbnail              -> image/webp (128px)
 - GET  /config                            -> { pipeline, providers, typesetting }
-- PATCH /config                           -> sparse replace of those three sections
+- PATCH /config                           -> top-level sparse merge; each provided
+  section replaces the stored one wholesale (send the full section object)
 - PUT/DELETE /config/providers/{id}/secret
 - GET  /llm/current                       -> { model, targetLanguage, instructions }
 - PUT  /llm/current {model, instructions?}-> select the translation model
@@ -144,3 +145,22 @@ Cargo manifests and the feature graph resolve (cargo generate-lockfile
 succeeded). A full cargo check requires the native -sys build scripts
 (bindgen + the LibTorch C++ shim), so run it inside the Dockerfile's Ubuntu
 builder.
+
+## Deployment notes (fnnas, verified 2026-08-14)
+
+- In --gpu mode the working OCR/translation combo is baberu-ocr plus a remote
+  translation provider: local GGUF translation is unavailable because --gpu
+  skips llama.cpp, and paddleocr-vl-1.6 also depends on llama.cpp.
+- Provider secrets live in the Linux keyutils session keyring
+  (PUT /config/providers/{id}/secret). They do not survive a container
+  restart, so re-PUT after every restart; the config file itself persists.
+- PATCH /config merges sparsely at the top level only: each section present
+  in the request replaces the stored section wholesale (PipelineConfig falls
+  back to serde defaults for missing fields), so always send the complete
+  section object.
+- PUT /llm/current and PATCH pipeline.translation.model write the same
+  pipeline field.
+- Verified end to end on the deployment box (i3-8100, 4 threads): a warm
+  single-page through-ocr run (detection + baberu-ocr) commits SourceText to
+  the scene, and through-translation commits a remote-provider Translation;
+  each takes well under a minute per page on this CPU.
