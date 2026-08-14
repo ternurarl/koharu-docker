@@ -1,5 +1,8 @@
+use std::sync::Arc;
+
 use anyhow::Result;
 use async_trait::async_trait;
+use futures::StreamExt;
 use koharu_scene::{Authored, LanguageTag, Origin, SourceText, Translation};
 use koharu_translator::{TranslationRequest, Translator};
 
@@ -8,6 +11,9 @@ use crate::TranslationConfig;
 use super::{StageInput, StageProcessor, finish, generation};
 
 const PRODUCER: &str = "dev.koharu.pipeline.translation";
+
+/// Maximum concurrent per-bubble translation requests per page.
+const TRANSLATION_CONCURRENCY: usize = 4;
 
 pub(super) struct Processor {
     config: TranslationConfig,
@@ -50,22 +56,41 @@ impl StageProcessor for Processor {
                 }
             }
         }
-        let mut request = TranslationRequest::new(
-            targets.iter().map(|(_, source)| source.clone()),
-            self.config.target_language,
-        );
-        if let Some(instructions) = self.config.instructions.as_deref() {
-            request = request.with_instructions(instructions);
+        // Translate each bubble through its own request so that a text-heavy
+        // page is not gated by one long generation. Requests run with bounded
+        // concurrency; a single failing bubble fails the stage, matching the
+        // previous whole-page behavior. Vision pages attach the page image to
+        // every bubble request (costly but correct).
+        let vision = Translator::supports_vision(&self.config.model);
+        let image = if vision {
+            input.images.get(&input.scene, input.page, "source").await?
+        } else {
+            None
+        };
+        let instructions = self.config.instructions.as_deref();
+        let mut requests = Vec::new();
+        for (_, source) in &targets {
+            let mut request =
+                TranslationRequest::new([source.clone()], self.config.target_language);
+            if let Some(instructions) = instructions {
+                request = request.with_instructions(instructions);
+            }
+            if let Some(image) = &image {
+                request = request.with_image(Arc::clone(image));
+            }
+            requests.push(
+                self.translator
+                    .translate(&self.config.model, self.config.generation, request),
+            );
         }
-        if Translator::supports_vision(&self.config.model)
-            && let Some(image) = input.images.get(&input.scene, input.page, "source").await?
-        {
-            request = request.with_image(image);
-        }
-        let (provider, translated) = self
-            .translator
-            .translate(&self.config.model, self.config.generation, request)
-            .await?;
+        let results: Vec<_> = futures::stream::iter(requests)
+            .buffer_unordered(TRANSLATION_CONCURRENCY)
+            .collect()
+            .await;
+        let provider = results
+            .iter()
+            .find_map(|result| result.as_ref().ok().map(|(provider, _)| *provider))
+            .unwrap_or_else(|| Translator::model(&self.config.model));
         let language = LanguageTag::new(self.config.target_language.tag())?;
         let generated = generation(PRODUCER, provider)?;
         let mut edit = input.scene.edit_as(generated.clone());
@@ -73,7 +98,7 @@ impl StageProcessor for Processor {
             edit.observe::<SourceText>(*entity)?;
             edit.observe::<Translation>(*entity)?;
         }
-        for ((entity, source), text) in targets.into_iter().zip(translated) {
+        for ((entity, source), result) in targets.into_iter().zip(results) {
             if input
                 .scene
                 .component::<Translation>(entity)?
@@ -81,10 +106,11 @@ impl StageProcessor for Processor {
             {
                 continue;
             }
+            let (_, translated) = result?;
             let text = if source.trim() == "\u{2026}" {
                 "\u{2026}".to_owned()
             } else {
-                text
+                translated.into_iter().next().unwrap_or_default()
             };
             edit.set(
                 entity,
