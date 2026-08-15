@@ -232,4 +232,4 @@ bun run build
 
 Copyright 2025-2026 Mayo Takanashi 与 Koharu 贡献者。
 
-Koharu 依据 [GNU General Public License version 3 only](LICENSE)（`GPL-3.0-only`）授权。
+Koharu 采用双许可证：[MIT 许可证](LICENSE-MIT) 或 [Apache 许可证 2.0](LICENSE-APACHE)，任选其一。
