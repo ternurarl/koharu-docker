@@ -4651,6 +4651,7 @@ dependencies = [
  "koharu-scene",
  "koharu-translator",
  "nvml-wrapper",
+ "rayon",
  "reqwest",
  "serde",
  "specta",
