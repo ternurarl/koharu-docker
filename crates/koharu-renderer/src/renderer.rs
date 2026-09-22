@@ -1178,6 +1178,7 @@ fn build_node(
                     height: decoded.height as f32,
                 },
                 text: None,
+                pixels: Some(decoded.clone()),
                 diagnostics: Arc::from([]),
             })
         }
@@ -1194,6 +1195,7 @@ fn build_node(
                     font_size: rendered.metadata.font_size,
                     color: rendered.metadata.color,
                 }),
+                pixels: None,
                 diagnostics: rendered.diagnostics.into(),
             })
         }
