@@ -35,6 +35,10 @@ impl<M> ModelCell<M> {
             .map(|mut model| model.take().is_some())
             .unwrap_or(false)
     }
+
+    pub(crate) async fn release(&self) -> bool {
+        self.lock().await.take().is_some()
+    }
 }
 
 impl<M> Default for ModelCell<M> {
@@ -47,6 +51,8 @@ impl<M> Default for ModelCell<M> {
 mod tests {
     use super::*;
 
+    use std::sync::Arc;
+
     #[tokio::test]
     async fn loads_once_until_unloaded() {
         let cell = ModelCell::new();
@@ -56,5 +62,25 @@ mod tests {
         assert!(cell.unload());
         cell.ensure(|| async { Ok(3_u32) }).await.unwrap();
         assert_eq!(*cell.lock().await, Some(3));
+    }
+
+    #[tokio::test]
+    async fn release_waits_for_the_model_lock() {
+        let cell = Arc::new(ModelCell::new());
+        cell.ensure(|| async { Ok(1_u32) }).await.unwrap();
+
+        let guard = cell.lock().await;
+        let release = {
+            let cell = Arc::clone(&cell);
+            tokio::spawn(async move { cell.release().await })
+        };
+        tokio::task::yield_now().await;
+        assert!(!release.is_finished());
+
+        drop(guard);
+        assert!(release.await.unwrap());
+        assert_eq!(*cell.lock().await, None);
+        cell.ensure(|| async { Ok(2_u32) }).await.unwrap();
+        assert_eq!(*cell.lock().await, Some(2));
     }
 }

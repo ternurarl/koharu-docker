@@ -82,6 +82,70 @@ async fn stop_after_a_page_keeps_completed_progress() {
     assert_eq!(report.status, RunStatus::Stopped);
     assert_eq!(report.completed, 1);
     assert_eq!(report.total, 2);
+    assert_eq!(report.released_models, vec![(Stage::Translation, false)]);
+}
+
+#[tokio::test]
+async fn detection_batch_failure_releases_before_inpainting_loads() {
+    let pipeline = pipeline(Default::default());
+    let mut session = koharu_scene::Session::memory().await.unwrap();
+    let patch = session
+        .snapshot()
+        .patch(|edit| {
+            edit.add_page(
+                koharu_scene::PageDraft::new("one", 1.0, 1.0),
+                koharu_scene::At::End,
+            )?;
+            edit.add_page(
+                koharu_scene::PageDraft::new("two", 1.0, 1.0),
+                koharu_scene::At::End,
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    session.commit(patch).await.unwrap();
+    let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorded = events.clone();
+    let request = Request {
+        operation: Operation::Stages {
+            stages: vec![Stage::Detection, Stage::Inpainting],
+        },
+        progress: Some(std::sync::Arc::new(move |event| {
+            recorded.lock().unwrap().push(event);
+        })),
+        ..Request::default()
+    };
+    let mut committer = RejectCommitter;
+
+    let error = pipeline
+        .execute(session.snapshot(), request, &mut committer)
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.stage, Some(Stage::Detection));
+    assert_eq!(error.kind, ErrorKind::Processing);
+    assert_eq!(
+        error.released_models,
+        vec![(Stage::Detection, true), (Stage::Detection, false)]
+    );
+    let events = events.lock().unwrap();
+    assert!(events.iter().any(|event| matches!(
+        event,
+        Progress::Loading {
+            stage: Stage::Detection,
+            ..
+        }
+    )));
+    assert!(events.iter().all(|event| !matches!(
+        event,
+        Progress::Loading {
+            stage: Stage::Inpainting,
+            ..
+        } | Progress::Running {
+            stage: Stage::Inpainting,
+            ..
+        }
+    )));
 }
 
 struct RejectCommitter;

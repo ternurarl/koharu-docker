@@ -30,6 +30,10 @@ impl StageProcessor for Processor {
         self.translator.unload()
     }
 
+    async fn release(&self) -> bool {
+        self.translator.release().await
+    }
+
     async fn load(&self) -> Result<()> {
         self.translator.load_model(&self.config.model).await
     }

@@ -15,6 +15,7 @@ pub enum ErrorKind {
 pub struct PipelineError {
     pub stage: Option<Stage>,
     pub kind: ErrorKind,
+    pub(crate) released_models: Vec<(Stage, bool)>,
     source: anyhow::Error,
 }
 
@@ -27,6 +28,7 @@ impl PipelineError {
         Self {
             stage,
             kind,
+            released_models: Vec::new(),
             source: source.into(),
         }
     }

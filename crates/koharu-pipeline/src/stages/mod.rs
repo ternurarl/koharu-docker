@@ -62,6 +62,7 @@ impl StageInput {
 trait StageProcessor: Send + Sync {
     fn model(&self) -> &'static str;
     fn unload(&self) -> bool;
+    async fn release(&self) -> bool;
     async fn load(&self) -> Result<()>;
     async fn process(&self, input: StageInput) -> Result<Patch>;
 }
@@ -110,6 +111,10 @@ impl Stages {
 
     pub(crate) fn unload(&self, stage: Stage) -> bool {
         self.processor(stage).unload()
+    }
+
+    pub(crate) async fn release(&self, stage: Stage) -> bool {
+        self.processor(stage).release().await
     }
 }
 
