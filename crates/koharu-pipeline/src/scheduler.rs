@@ -136,6 +136,15 @@ impl Scheduler {
             self.active_stage += 1;
         }
     }
+
+    pub(crate) fn stage_finished(&self, stage: Stage) -> bool {
+        self.pages.iter().all(|page| {
+            page.stages
+                .iter()
+                .find(|work| work.stage == stage)
+                .is_none_or(|work| work.state == WorkState::Finished)
+        })
+    }
 }
 
 const fn prerequisite(stage: Stage) -> Option<Stage> {
