@@ -47,6 +47,10 @@ impl StageRunner {
         }
     }
 
+    pub(crate) async fn release_stage(&self, stage: Stage) -> bool {
+        self.stages.release(stage).await
+    }
+
     async fn run_with_recovery(
         &self,
         job: &StageJob,
@@ -126,12 +130,16 @@ impl StageRunner {
     }
 
     fn stage_error(&self, stage: Stage, model: &str, failure: AttemptFailure) -> PipelineError {
-        self.stages.unload(stage);
+        let unloaded = self.stages.unload(stage);
         let message = match failure.kind {
             ErrorKind::ModelLoad => format!("failed to load {model}"),
             _ => format!("{model} failed"),
         };
-        PipelineError::new(failure.kind, Some(stage), failure.error.context(message))
+        let mut error = PipelineError::new(failure.kind, Some(stage), failure.error.context(message));
+        if unloaded {
+            error.released_models.push((stage, true));
+        }
+        error
     }
 }
 

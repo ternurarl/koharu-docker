@@ -89,6 +89,10 @@ impl Translator {
             .unwrap_or(false)
     }
 
+    pub async fn release(&self) -> bool {
+        self.local.lock().await.take().is_some()
+    }
+
     #[tracing::instrument(skip_all)]
     pub async fn load_model(&self, selection: &ModelSelection) -> anyhow::Result<()> {
         if selection.provider == Provider::Local {
@@ -195,5 +199,23 @@ mod tests {
             "lfm2.5-1.2b-instruct",
             true
         )));
+    }
+
+    #[tokio::test]
+    async fn remote_release_returns_false() {
+        let translator = Translator::from_config(
+            Device::cpu(),
+            koharu_config::Config::memory(ProvidersConfig::default()),
+        )
+        .unwrap();
+        let selection = ModelSelection {
+            provider: Provider::OpenAi,
+            model: Some("gpt-4.1-mini".to_owned()),
+            quantization: None,
+            vision: false,
+        };
+
+        assert!(!translator.release().await);
+        assert!(translator.loaded(&selection));
     }
 }

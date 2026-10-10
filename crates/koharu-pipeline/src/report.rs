@@ -19,6 +19,7 @@ pub struct Report {
     pub completed: usize,
     pub total: usize,
     pub elapsed: Duration,
+    pub(crate) released_models: Vec<(Stage, bool)>,
 }
 
 #[derive(Debug)]

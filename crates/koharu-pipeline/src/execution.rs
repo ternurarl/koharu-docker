@@ -36,6 +36,8 @@ pub(crate) struct Execution<'a> {
     base: koharu_scene::Revision,
     started: Instant,
     inpainting_mask: Option<crate::InpaintingMask>,
+    active_batch: Option<Stage>,
+    released: Vec<(Stage, bool)>,
 }
 
 impl<'a> Execution<'a> {
@@ -88,11 +90,14 @@ impl<'a> Execution<'a> {
             base,
             started,
             inpainting_mask: request.inpainting_mask,
+            active_batch: None,
+            released: Vec::new(),
         })
     }
 
     pub(crate) async fn run(mut self) -> std::result::Result<Report, PipelineError> {
         if self.stopped() {
+            self.release_active_batch().await;
             return Ok(self.report(RunStatus::Stopped));
         }
 
@@ -102,31 +107,44 @@ impl<'a> Execution<'a> {
         let runner = self.runner.clone();
         let mut running = FuturesUnordered::new();
         loop {
-            while let Some(job) = self.take_ready_job() {
+            while let Some(job) = self.take_ready_job().await {
                 running.push(runner.run(job));
             }
 
             let Some(completion) = running.next().await else {
                 break;
             };
+            let completed_stage = completion.stage;
             self.busy_stages.remove(&completion.stage);
+            let batch_drained = self
+                .active_batch
+                .is_some_and(|stage| stage == completed_stage && !self.busy_stages.contains(&stage));
             if self.stopped() || self.failure.is_some() {
                 continue;
             }
             if let Err(error) = self.apply_completion(completion).await {
                 self.failure = Some(error);
             }
+            if batch_drained {
+                self.finish_batch(completed_stage);
+                self.release_active_batch().await;
+            }
         }
 
+        if let Some(stage) = self.active_batch {
+            self.finish_batch(stage);
+        }
+        self.release_active_batch().await;
         self.finalize()
     }
 
-    fn take_ready_job(&mut self) -> Option<StageJob> {
+    async fn take_ready_job(&mut self) -> Option<StageJob> {
         if self.stopped() || self.failure.is_some() {
             return None;
         }
         let (page, stage) = self.scheduler.start_next(&self.busy_stages)?;
         self.busy_stages.insert(stage);
+        self.active_batch = Some(stage);
         let images = self
             .images
             .entry(page)
@@ -164,14 +182,14 @@ impl<'a> Execution<'a> {
         match outcome? {
             StageOutcome::Stopped => {}
             StageOutcome::Skipped => {
-                self.mark_complete(page, stage);
+                self.mark_page_stage(page, stage);
                 progress::emit(self.progress.as_ref(), Progress::Skipped { page, stage });
             }
             StageOutcome::Patch(patch) => {
                 if !self.commit_patch(page, stage, patch).await? {
                     return Ok(());
                 }
-                self.mark_complete(page, stage);
+                self.mark_page_stage(page, stage);
                 progress::emit(
                     self.progress.as_ref(),
                     Progress::Finished {
@@ -216,7 +234,24 @@ impl<'a> Execution<'a> {
         Ok(true)
     }
 
-    fn mark_complete(&mut self, page: EntityId, stage: Stage) {
+    async fn release_active_batch(&mut self) {
+        let Some(stage) = self.active_batch.take() else {
+            return;
+        };
+        debug_assert!(
+            !self.busy_stages.contains(&stage),
+            "a stage batch cannot be released while one of its jobs is running"
+        );
+        let released = self.runner.release_stage(stage).await;
+        self.released.push((stage, released));
+    }
+
+    fn finish_batch(&mut self, stage: Stage) {
+        self.scheduler.finish_stage(stage);
+        self.images.clear();
+    }
+
+    fn mark_page_stage(&mut self, page: EntityId, stage: Stage) {
         if self.scheduler.complete_stage(page, stage) {
             self.images.remove(&page);
         }
@@ -228,7 +263,8 @@ impl<'a> Execution<'a> {
     }
 
     fn finalize(mut self) -> std::result::Result<Report, PipelineError> {
-        if let Some(error) = self.failure.take() {
+        if let Some(mut error) = self.failure.take() {
+            error.released_models.extend(self.released);
             return Err(error);
         }
         if !self.stopped() && self.completed != self.scheduler.total() {
@@ -258,6 +294,7 @@ impl<'a> Execution<'a> {
             completed: self.completed,
             total: self.scheduler.total(),
             elapsed: self.started.elapsed(),
+            released_models: self.released.clone(),
         }
     }
 }
