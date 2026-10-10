@@ -125,13 +125,14 @@ impl<'a> Execution<'a> {
             if let Err(error) = self.apply_completion(completion).await {
                 self.failure = Some(error);
             }
-            if batch_drained {
-                self.finish_batch(completed_stage);
+            if batch_drained && self.scheduler.stage_finished(completed_stage) {
                 self.release_active_batch().await;
             }
         }
 
-        if let Some(stage) = self.active_batch {
+        if let Some(stage) = self.active_batch
+            && (self.stopped() || self.failure.is_some())
+        {
             self.finish_batch(stage);
         }
         self.release_active_batch().await;
@@ -248,7 +249,7 @@ impl<'a> Execution<'a> {
 
     fn finish_batch(&mut self, stage: Stage) {
         self.scheduler.finish_stage(stage);
-        self.images.clear();
+        self.clear_images();
     }
 
     fn mark_page_stage(&mut self, page: EntityId, stage: Stage) {
@@ -256,6 +257,16 @@ impl<'a> Execution<'a> {
             self.images.remove(&page);
         }
         self.completed += 1;
+        if self
+            .active_batch
+            .is_some_and(|active| active == stage && self.scheduler.stage_finished(stage))
+        {
+            self.clear_images();
+        }
+    }
+
+    fn clear_images(&mut self) {
+        self.images.clear();
     }
 
     fn stopped(&self) -> bool {
