@@ -15,6 +15,9 @@ use vello::{
     util::RenderContext,
 };
 
+use crate::compose::Canvas;
+use crate::frame::{Layer, LayerKind};
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum DownsampleFilter {
     Nearest,
@@ -69,6 +72,12 @@ impl Default for RasterOptions {
 }
 
 const MAX_SUPERSAMPLING_FACTOR: u32 = 4;
+
+/// Mirrors the visibility gate inside `Layer::append_with_presentation`.
+fn is_presented(layer: &Layer) -> bool {
+    let presentation = layer.presentation();
+    presentation.visible && presentation.opacity.is_finite() && presentation.opacity > 0.0
+}
 
 #[derive(Debug)]
 pub struct Raster {
@@ -130,6 +139,13 @@ impl Rasterizer {
         })
     }
 
+    /// Composites a frame in strict layer order.
+    ///
+    /// Image layers are composited on the CPU (`Canvas::overlay_decoded`), so full-page
+    /// images never go through Vello's image atlas. Runs of consecutive text layers are
+    /// rendered by Vello onto a transparent surface and overlaid as a block, preserving
+    /// the original layer interleaving. Pages without any image layer keep the original
+    /// single-scene Vello path untouched.
     pub(crate) fn rasterize(
         &self,
         frame: &crate::Frame,
@@ -137,10 +153,188 @@ impl Rasterizer {
     ) -> crate::Result<Raster> {
         let (width, height) = frame.size();
         let (left, top) = frame.origin();
+        if !frame
+            .layers()
+            .iter()
+            .any(|layer| matches!(layer.kind(), LayerKind::Image(_)))
+        {
+            // No image layers: original single-scene Vello path, unchanged.
+            let image = self
+                .rasterize_scene_inner(frame.scene(), width, height, [0, 0, 0, 0], options)
+                .map_err(crate::Error::Backend)?;
+            return Ok(Raster { image, left, top });
+        }
         let image = self
-            .rasterize_scene_inner(frame.scene(), width, height, [0, 0, 0, 0], options)
+            .rasterize_layered(frame, options)
             .map_err(crate::Error::Backend)?;
         Ok(Raster { image, left, top })
+    }
+
+    /// Layered path for pages that contain at least one image layer.
+    ///
+    /// Visible, axis-aligned image layers with decoded pixels are composited on the CPU;
+    /// text runs (and rotated/skewed image-layer fallbacks) are rendered by Vello with a
+    /// transparent background and overlaid in place so ordering is never rearranged.
+    fn rasterize_layered(
+        &self,
+        frame: &crate::Frame,
+        options: RasterOptions,
+    ) -> Result<RgbaImage> {
+        let (width, height) = frame.size();
+        if width == 0 || height == 0 {
+            bail!("invalid render surface {width}x{height}");
+        }
+        let layers = frame.layers();
+        let normalization = frame.0.normalization;
+        let factor = options.scale();
+        let placement = |layer: &Layer| normalization * layer.0.placement;
+
+        // Phase 1: does any image layer actually go through CPU composition?
+        let needs_canvas = layers.iter().any(|layer| {
+            matches!(layer.kind(), LayerKind::Image(_))
+                && is_presented(layer)
+                && {
+                    let [_, b, c, ..] = placement(layer).as_coeffs();
+                    b.abs() <= 1e-9 && c.abs() <= 1e-9
+                }
+                && layer.decoded_image().is_some()
+        });
+
+        if !needs_canvas {
+            // Nothing to composite on the CPU: one Vello scene covers every drawable
+            // layer (text plus rotated image-layer fallbacks); skipped image layers
+            // (hidden, empty, or pixel-less) contribute nothing.
+            let mut scene = Scene::new();
+            let mut drawable = false;
+            for layer in layers {
+                match layer.kind() {
+                    LayerKind::Text(_) => {
+                        if !is_presented(layer) {
+                            continue;
+                        }
+                        layer.append_to(&mut scene, Some(normalization));
+                        drawable = true;
+                    }
+                    LayerKind::Image(_) => {
+                        if !is_presented(layer) {
+                            continue;
+                        }
+                        let [_, b, c, ..] = placement(layer).as_coeffs();
+                        if b.abs() > 1e-9 || c.abs() > 1e-9 {
+                            // Rotation/shear cannot be expressed by overlay_decoded;
+                            // fall back to Vello for correctness.
+                            layer.append_to(&mut scene, Some(normalization));
+                            drawable = true;
+                            continue;
+                        }
+                        if layer.decoded_image().is_none() {
+                            continue;
+                        }
+                        // Unreachable: this layer would have made `needs_canvas` true.
+                        layer.append_to(&mut scene, Some(normalization));
+                        drawable = true;
+                    }
+                }
+            }
+            if !drawable {
+                // No text, no fallback: never touch the GPU.
+                return Ok(RgbaImage::new(width, height));
+            }
+            return self.rasterize_scene_inner(&scene, width, height, [0, 0, 0, 0], options);
+        }
+
+        let raster_width = width
+            .checked_mul(factor)
+            .context("supersampled render surface width overflow")?;
+        let raster_height = height
+            .checked_mul(factor)
+            .context("supersampled render surface height overflow")?;
+        let mut canvas = Canvas::new(raster_width, raster_height);
+        // Consecutive text/fallback layers accumulate here until the next CPU overlay.
+        let mut run: Option<Scene> = None;
+        for layer in layers {
+            match layer.kind() {
+                LayerKind::Text(_) => {
+                    if !is_presented(layer) {
+                        continue;
+                    }
+                    layer.append_to(run.get_or_insert_with(Scene::new), Some(normalization));
+                }
+                LayerKind::Image(_) => {
+                    let presentation = layer.presentation();
+                    if !presentation.visible
+                        || !presentation.opacity.is_finite()
+                        || presentation.opacity <= 0.0
+                    {
+                        continue;
+                    }
+                    let [a, b, c, d, e, f] = placement(layer).as_coeffs();
+                    if b.abs() > 1e-9 || c.abs() > 1e-9 {
+                        // Rotation/shear fallback: render through Vello inside the
+                        // current run so layer order is preserved.
+                        layer.append_to(run.get_or_insert_with(Scene::new), Some(normalization));
+                        continue;
+                    }
+                    let Some(decoded) = layer.decoded_image() else {
+                        continue;
+                    };
+                    if let Some(scene) = run.take() {
+                        let run_image =
+                            self.render_run(&scene, raster_width, raster_height, factor)?;
+                        canvas.overlay_rgba_full(&run_image, 1.0);
+                    }
+                    let scale = f64::from(factor);
+                    canvas.overlay_decoded(
+                        &decoded,
+                        a * scale,
+                        d * scale,
+                        e * scale,
+                        f * scale,
+                        presentation.opacity.clamp(0.0, 1.0),
+                    );
+                }
+            }
+        }
+        if let Some(scene) = run.take() {
+            let run_image = self.render_run(&scene, raster_width, raster_height, factor)?;
+            canvas.overlay_rgba_full(&run_image, 1.0);
+        }
+        let mut image = canvas.into_rgba();
+        if factor > 1 {
+            let mut downsampled = RgbaImage::new(width, height);
+            let resize_options = ResizeOptions::new()
+                .resize_alg(options.downsample_filter.into())
+                .use_alpha(true);
+            Resizer::new()
+                .resize(&image, &mut downsampled, &resize_options)
+                .context("failed to downsample composited render")?;
+            image = downsampled;
+        }
+        Ok(image)
+    }
+
+    /// Renders one accumulated run at the (already supersampled) target size with a
+    /// transparent background; the whole canvas is downsampled once at the end instead.
+    fn render_run(
+        &self,
+        scene: &Scene,
+        width: u32,
+        height: u32,
+        factor: u32,
+    ) -> Result<RgbaImage> {
+        let scaled;
+        let scene = if factor == 1 {
+            scene
+        } else {
+            scaled = {
+                let mut scaled = Scene::new();
+                scaled.append(scene, Some(Affine::scale(f64::from(factor))));
+                scaled
+            };
+            &scaled
+        };
+        let pixels = self.readback(scene, width, height, [0, 0, 0, 0])?;
+        RgbaImage::from_raw(width, height, pixels).context("WGPU returned an invalid RGBA buffer")
     }
 
     pub(crate) fn rasterize_scene(

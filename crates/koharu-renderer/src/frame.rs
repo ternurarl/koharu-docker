@@ -12,7 +12,7 @@ use vello::{
     peniko::{Fill, Mix},
 };
 
-use crate::{Error, Result, TextAlign, WritingMode};
+use crate::{Error, Result, TextAlign, WritingMode, images::DecodedImage};
 
 const MAX_SURFACE_DIMENSION: u32 = 32_768;
 const MAX_SURFACE_PIXELS: u64 = 268_435_456;
@@ -284,6 +284,10 @@ impl Layer {
         &self.0.dependencies
     }
 
+    pub(crate) fn decoded_image(&self) -> Option<Arc<DecodedImage>> {
+        self.0.node.pixels.clone()
+    }
+
     pub fn append_to(&self, scene: &mut Scene, transform: Option<Affine>) {
         self.append_with_presentation(scene, transform, self.0.presentation);
     }
@@ -438,6 +442,7 @@ pub(crate) struct RetainedNode {
     pub(crate) scene: Arc<Scene>,
     pub(crate) local_bounds: RenderBounds,
     pub(crate) text: Option<LocalTextMetadata>,
+    pub(crate) pixels: Option<Arc<DecodedImage>>,
     pub(crate) diagnostics: Arc<[RenderDiagnostic]>,
 }
 

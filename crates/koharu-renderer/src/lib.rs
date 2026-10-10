@@ -1,6 +1,7 @@
 //! Retained rendering of one semantic Koharu page.
 
 mod bubble;
+mod compose;
 mod config;
 mod error;
 mod fonts;
