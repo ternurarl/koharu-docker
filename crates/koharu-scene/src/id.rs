@@ -51,6 +51,14 @@ entity_id!(RelationId);
 #[serde(transparent)]
 pub struct ProjectId(pub(crate) koharu_storage::DocumentId);
 
+impl ProjectId {
+    /// The storage document this project is stored as.
+    #[must_use]
+    pub fn document(self) -> koharu_storage::DocumentId {
+        self.0
+    }
+}
+
 impl fmt::Display for ProjectId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(formatter)

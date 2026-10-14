@@ -134,3 +134,31 @@ pub fn device(cpu: bool) -> Device {
 pub fn llama_backend() -> Option<&'static LlamaBackend> {
     LLAMA.get()
 }
+
+/// Which native runtimes `init`, `init_cpu`, or `init_gpu` brought up.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RuntimeInit {
+    /// Torch only, from `init_cpu`.
+    Cpu,
+    /// Torch and stable-diffusion.cpp, from `init_gpu`.
+    Gpu,
+    /// Torch, llama.cpp, and stable-diffusion.cpp, from `init`.
+    Full,
+}
+
+/// Reports which native runtimes this process initialized.
+///
+/// A task subprocess uses this to initialize the same runtimes as its parent.
+/// `None` means this process has not initialized any, so there is nothing to
+/// copy.
+#[must_use]
+pub fn runtime_init() -> Option<RuntimeInit> {
+    if READY.get().is_none() {
+        return None;
+    }
+    Some(match (LLAMA.get().is_some(), DIFFUSION.get().is_some()) {
+        (true, _) => RuntimeInit::Full,
+        (false, true) => RuntimeInit::Gpu,
+        (false, false) => RuntimeInit::Cpu,
+    })
+}

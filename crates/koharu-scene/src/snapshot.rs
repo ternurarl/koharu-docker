@@ -214,6 +214,17 @@ impl Snapshot {
         self.storage.blobs().get(id).await.map_err(Into::into)
     }
 
+    /// The encoded scene checkpoint [`Session::from_checkpoint`] reads back.
+    pub fn checkpoint(&self) -> Result<Vec<u8>> {
+        revision::to_vec(&self.state.to_checkpoint()).map_err(Into::into)
+    }
+
+    /// Every blob the scene references, in the order a copy should export them.
+    #[must_use]
+    pub fn blob_ids(&self) -> Vec<BlobId> {
+        self.state.referenced_blobs().into_iter().collect()
+    }
+
     #[must_use]
     pub fn edit(&self) -> Edit {
         Edit::new(self.clone(), None)

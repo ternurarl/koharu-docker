@@ -44,8 +44,10 @@ RUN --mount=type=cache,target=/root/.cache/koharu \
     --mount=type=cache,target=/opt/cargo/registry \
     --mount=type=cache,target=/app/target \
     cargo build -p koharu --release --locked --no-default-features --features headless \
+    && cargo build -p koharu-pipeline --release --locked --bin pipeline-task \
     && mkdir -p /out \
     && cp /app/target/release/koharu /out/koharu \
+    && cp /app/target/release/pipeline-task /out/pipeline-task \
     && cp /app/target/release/libkoharu-torch.so /out/libkoharu-torch.so
 
 FROM ubuntu:24.04 AS runtime
@@ -60,6 +62,7 @@ RUN apt-get update \
     && install -d -o koharu -g koharu -m 755 /home/koharu/.local/share/Koharu
 
 COPY --from=builder /out/koharu /usr/local/bin/koharu
+COPY --from=builder /out/pipeline-task /usr/local/bin/pipeline-task
 COPY --from=builder /out/libkoharu-torch.so /usr/local/lib/libkoharu-torch.so
 RUN ldconfig
 

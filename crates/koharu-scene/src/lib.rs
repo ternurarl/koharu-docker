@@ -34,7 +34,7 @@ pub use document::{AnalysisRegionRef, GroupRef, TextContentRef, TextLayerRef};
 pub use edit::{At, Edit, RemovePolicy};
 pub use error::{Error, Result};
 pub use id::{EntityId, ProducerId, ProjectId, RelationId};
-pub use patch::Patch;
+pub use patch::{Patch, PatchTransfer};
 pub use semantics::{
     BubbleRegion, FitsTo, FlowsIn, FunctionalRelation, Inside, PanelRegion, Presents,
     RecognizedFrom, RegionSpec, RelationSpec, TextRegion,
@@ -42,7 +42,7 @@ pub use semantics::{
 pub use session::{Commit, Session};
 pub use snapshot::{EntityRef, PageRef, RelationRef, Snapshot};
 
-pub use koharu_storage::{BlobId, PatchId, Revision};
+pub use koharu_storage::{BlobId, DocumentId, PatchId, Revision};
 
 #[cfg(test)]
 mod tests;
