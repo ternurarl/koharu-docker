@@ -152,11 +152,22 @@ async fn start_pipeline(
         }
 
         let mut committer = SessionCommitter { app: app_c.clone() };
-        let task = app_c
+        let release = app_c
             .pipeline
-            .execute(snapshot, request, &mut committer)
-            .await;
-        let result = task.release_resources().await.result;
+            .execute_in_subprocess(snapshot, request, &mut committer)
+            .await
+            .map_err(anyhow::Error::from);
+        // The task subprocess reports what it released so the caller can check
+        // the release order survived the process boundary.
+        if let Ok(release) = &release {
+            tracing::info!(
+                operation_id = %op_id_c,
+                released_models = ?release.released_models,
+                image_cache_items = release.image_cache_items,
+                "task resources released"
+            );
+        }
+        let result = release.and_then(|release| release.result.map_err(anyhow::Error::from));
         let (status, error) = match result {
             Ok(report) if report.status == RunStatus::Stopped => (JobStatus::Cancelled, None),
             Ok(_) => (JobStatus::Completed, None),

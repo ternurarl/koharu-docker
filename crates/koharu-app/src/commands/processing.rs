@@ -212,12 +212,15 @@ pub(crate) async fn process(
             handle: task_handle.clone(),
             revisions: Vec::new(),
         };
-        let task = pipeline.execute(snapshot, request, &mut committer).await;
-        let result = task.release_resources().await.result;
+        let result = pipeline
+            .execute_in_subprocess(snapshot, request, &mut committer)
+            .await
+            .map_err(anyhow::Error::from)
+            .and_then(|release| release.result.map_err(anyhow::Error::from));
         let (stopped, error) = match result {
             Ok(report) => (report.status == RunStatus::Stopped, None),
             Err(error) => {
-                tracing::error!(stage = ?error.stage, %error, "processing failed");
+                tracing::error!(%error, "processing failed");
                 (false, Some(format!("{error:#}")))
             }
         };

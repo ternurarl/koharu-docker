@@ -514,6 +514,85 @@ impl Patch {
     }
 }
 
+/// A patch reduced to the bytes another process can carry.
+///
+/// [`Patch`] keeps the scene state it was built from, and that state owns the
+/// storage session of the process that produced it. A task subprocess therefore
+/// sends this envelope instead, and the parent rebuilds a [`Patch`] against its
+/// own snapshot before committing. `stage` and `page` repeat the stage output
+/// the patch belongs to, because the parent has to commit it before the label
+/// is attached.
+#[revisioned(revision = 1)]
+#[derive(Clone)]
+pub struct PatchTransfer {
+    pub stage: String,
+    pub page: EntityId,
+    /// The document the patch applies to. A process that built the patch
+    /// against a copy of the scene overwrites this with the original document
+    /// before sending it, because the copy's own document would not match.
+    pub project: koharu_storage::DocumentId,
+    /// The revision the patch was computed against. The receiver rejects the
+    /// transfer when this is not its current revision.
+    pub base: koharu_storage::Revision,
+    observations: Vec<Observation>,
+    operations: Vec<Operation>,
+    attachments: Vec<(BlobId, Vec<u8>)>,
+    label: Option<String>,
+}
+
+impl Patch {
+    pub fn to_transfer(&self, stage: impl Into<String>, page: EntityId) -> PatchTransfer {
+        PatchTransfer {
+            stage: stage.into(),
+            page,
+            project: self.project,
+            base: self.base_revision,
+            observations: self.observations.to_vec(),
+            operations: self.operations.to_vec(),
+            attachments: self
+                .attachments
+                .iter()
+                .map(|(blob, bytes)| (*blob, bytes.to_vec()))
+                .collect(),
+            label: self.label.as_deref().map(str::to_owned),
+        }
+    }
+
+    /// Rebuilds the patch so it applies to `snapshot`.
+    ///
+    /// The transfer names the revision it was computed against. Rebuilding
+    /// fails when that revision is not the snapshot's, because applying the
+    /// operations to a newer scene would silently drop the conflict checks the
+    /// producing process already made.
+    pub fn from_transfer(snapshot: &Snapshot, transfer: PatchTransfer) -> Result<Self> {
+        if transfer.project != snapshot.state.document {
+            return Err(Error::invalid("patch belongs to another project"));
+        }
+        if transfer.base != snapshot.state.revision {
+            return Err(Error::Storage(koharu_storage::Error::RevisionConflict {
+                current: snapshot.state.revision,
+                proposed: transfer.base,
+            }));
+        }
+        for observation in &transfer.observations {
+            observation.validate(&snapshot.state)?;
+        }
+        let state = apply_operations(&snapshot.state, &transfer.operations)?;
+        Self::new(
+            snapshot,
+            state,
+            transfer.observations,
+            transfer.operations,
+            transfer
+                .attachments
+                .into_iter()
+                .map(|(blob, bytes)| (blob, bytes::Bytes::from(bytes)))
+                .collect(),
+            transfer.label.map(Arc::from),
+        )
+    }
+}
+
 pub(crate) fn apply_operations(state: &State, operations: &[Operation]) -> Result<State> {
     let mut next = state.clone();
     for operation in operations {

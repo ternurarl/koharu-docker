@@ -17,6 +17,8 @@ mod stage;
 mod stage_runner;
 mod stages;
 
+mod worker;
+
 pub use config::{
     DetectionModel, InpaintingModel, OcrModel, PipelineConfig, ProcessorConfig, TranslationConfig,
 };
@@ -29,6 +31,14 @@ pub use resources::{DeviceResources, ResourceSnapshot};
 pub use scope::{Bounds, Scope};
 pub use stage::Stage;
 pub use stages::{Flux2KleinConfig, KoharuLayoutRFDetrSeg2XLConfig, RoremMixedConfig};
+
+/// Runs the task subprocess to completion.
+///
+/// `project` is the scratch project the parent exported. The assignment arrives
+/// on standard input and the committed patches leave on standard output.
+pub async fn run_task_subprocess(project: std::path::PathBuf) -> anyhow::Result<()> {
+    worker::run(project).await
+}
 
 use images::ImageCache;
 use model_cell::ModelCell;

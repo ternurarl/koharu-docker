@@ -3,6 +3,8 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
+use tokio::sync::Notify;
+
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use specta::Type;
@@ -83,15 +85,36 @@ impl Default for Request {
 }
 
 #[derive(Clone, Default)]
-pub struct StopToken(Arc<AtomicBool>);
+pub struct StopToken(Arc<StopState>);
+
+#[derive(Default)]
+struct StopState {
+    stopped: AtomicBool,
+    notify: Notify,
+}
 
 impl StopToken {
     pub fn stop(&self) {
-        self.0.store(true, Ordering::Release);
+        self.0.stopped.store(true, Ordering::Release);
+        self.0.notify.notify_waiters();
     }
 
     #[must_use]
     pub fn stopped(&self) -> bool {
-        self.0.load(Ordering::Acquire)
+        self.0.stopped.load(Ordering::Acquire)
+    }
+
+    /// Resolves when [`Self::stop`] has been called.
+    ///
+    /// A task subprocess waits on this so a cancellation in the parent reaches
+    /// the child, which has its own flag.
+    pub async fn cancelled(&self) {
+        loop {
+            let notified = self.0.notify.notified();
+            if self.stopped() {
+                return;
+            }
+            notified.await;
+        }
     }
 }

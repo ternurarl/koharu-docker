@@ -166,10 +166,11 @@ impl KoharuHost {
         let task = self
             .handle
             .state::<koharu_pipeline::Pipeline>()
-            .execute(snapshot, request, &mut committer)
-            .await;
+            .execute_in_subprocess(snapshot, request, &mut committer)
+            .await
+            .map_err(|error| anyhow!(error))?;
         watcher.abort();
-        let result = task.release_resources().await.result;
+        let result = task.result;
         self.handle.state::<Processing>().stops.lock().remove(&job);
         let report = result.map_err(|error| anyhow!(error))?;
         if report.status == RunStatus::Stopped {

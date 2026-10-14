@@ -19,6 +19,9 @@ TARGETS = (
     ("lama", "models--mayocream--lama-manga", "f91c85b26913b3e83f9877867b4c336da3675238", "lama-manga.safetensors"),
 )
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tif", ".tiff"}
+# Resident anonymous memory may wobble by a few MiB across a task; only a
+# sustained increase is the leak this audit is looking for.
+RSS_ANON_SLACK_KIB = 4096
 
 
 def command(args: list[str]) -> str:
@@ -38,6 +41,18 @@ def write_text(path: Path, content: str) -> None:
 
 def mebibytes(kib: int) -> str:
     return f"{kib / 1024:,.1f} MiB"
+
+
+def user_name(uid: int) -> str:
+    """The owner of the audited process.
+
+    An audit run from a container may not share the host's user database, so an
+    unmapped uid is reported as its number rather than failing the run.
+    """
+    try:
+        return pwd.getpwuid(uid).pw_name
+    except KeyError:
+        return str(uid)
 
 
 def find_pid(explicit: int | None) -> int:
@@ -110,15 +125,48 @@ def swap_by_mapping(pid: int) -> list[dict[str, int | str]]:
     return sorted(rows, key=lambda item: int(item["swap_kib"]), reverse=True)
 
 
+ADDRESS_RANGE = re.compile(r"^[0-9a-fA-F]+-[0-9a-fA-F]+\s")
+
+
+def mapping_lines(pid: int) -> list[str]:
+    """Raw /proc/PID/maps lines, excluding any error placeholder.
+
+    `read_text` reports an unreadable file as a single prose line, which is
+    not a mapping and must never reach the address-range parsers.
+    """
+    return [
+        line
+        for line in read_text(Path(f"/proc/{pid}/maps")).splitlines()
+        if ADDRESS_RANGE.match(line)
+    ]
+
+
 def map_files(pid: int) -> list[tuple[str, int]]:
     sizes: dict[str, int] = defaultdict(int)
-    for line in read_text(Path(f"/proc/{pid}/maps")).splitlines():
+    for line in mapping_lines(pid):
         parts = line.split()
         if len(parts) < 6:
             continue
         start, end = parts[0].split("-")
         sizes[parts[-1]] += int(end, 16) - int(start, 16)
     return sorted(sizes.items(), key=lambda item: item[1], reverse=True)
+
+
+def anonymous_mappings(pid: int) -> dict[str, int]:
+    """Size of each anonymous mapping the process holds.
+
+    The task subprocess boundary is validated by these not growing: the model
+    runtimes keep their allocations under `[anonymous]`, `[heap]` and `memfd`
+    even after every Rust owner is dropped.
+    """
+    sizes: dict[str, int] = defaultdict(int)
+    for line in mapping_lines(pid):
+        parts = line.split()
+        start, end = parts[0].split("-")
+        path = parts[-1] if len(parts) >= 6 else "[anonymous]"
+        if path in ("[heap]", "[stack]") or path.startswith("[anon") or path.startswith("/memfd:") or path.startswith("anon_inode:"):
+            sizes[path] += int(end, 16) - int(start, 16)
+    return dict(sizes)
 
 
 def category(path: str) -> str:
@@ -198,9 +246,64 @@ def children(pid: int) -> list[dict[str, str]]:
     return rows
 
 
+def diff(before: dict, after: dict) -> dict[str, object]:
+    """Compare two audit reports the way the acceptance criteria read them.
+
+    The task subprocess boundary is the fix: once the child exits, the parent
+    must not keep the anonymous mappings or swap pages the run allocated.
+    """
+    grown = {
+        name: size - before["anonymous_mappings_bytes"].get(name, 0)
+        for name, size in after["anonymous_mappings_bytes"].items()
+        if size > before["anonymous_mappings_bytes"].get(name, 0)
+    }
+    return {
+        "memory_current_delta": after["memory_current"] - before["memory_current"],
+        "memory_swap_current_delta": after["memory_swap_current"] - before["memory_swap_current"],
+        "swap_kib_delta": after["swap_kib"] - before["swap_kib"],
+        "rss_anon_delta": after["status_kib"]["RssAnon"] - before["status_kib"]["RssAnon"],
+        "heap_delta": after["anonymous_mappings_bytes"].get("[heap]", 0)
+        - before["anonymous_mappings_bytes"].get("[heap]", 0),
+        "growing_anonymous_mappings_bytes": grown,
+        "task_children": after.get("task_children", []),
+        "open_model_files": after.get("open_model_files", []),
+    }
+
+
+def verdict(report: dict[str, object]) -> list[str]:
+    """One line per acceptance criterion that did not hold.
+
+    Anonymous mappings reserve address space up front, so their size alone is
+    not a leak: an arena that grows its reservation stays flat in RSS. What has
+    to hold is that resident anonymous memory, the heap, and swap do not grow,
+    and that the task left neither a subprocess nor an open model file behind.
+    """
+    failures = []
+    if report["memory_swap_current_delta"] > 0:
+        failures.append(
+            f"memory.swap.current grew by {report['memory_swap_current_delta']} bytes"
+        )
+    if report["swap_kib_delta"] > 0:
+        failures.append(f"VmSwap grew by {report['swap_kib_delta']} KiB")
+    if report["rss_anon_delta"] > RSS_ANON_SLACK_KIB:
+        failures.append(f"RssAnon grew by {report['rss_anon_delta']} KiB")
+    if report["heap_delta"] > 0:
+        failures.append(f"[heap] grew by {report['heap_delta']} bytes")
+    if report["task_children"]:
+        failures.append("pipeline-task subprocess is still running")
+    if report["open_model_files"]:
+        failures.append("parent still holds model files open")
+    return failures
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Read-only koharu memory attribution audit.")
     parser.add_argument("--pid", type=int)
+    parser.add_argument(
+        "--compare",
+        type=Path,
+        help="a report.json taken before the task; prints the acceptance verdict",
+    )
     parser.add_argument("--output", type=Path, default=Path("/home/qinzhu") / f"koharu-memory-audit-{dt.datetime.now():%Y%m%d-%H%M%S}")
     args = parser.parse_args()
     if hasattr(os, "geteuid") and os.geteuid() != 0:
@@ -220,28 +323,45 @@ def main() -> None:
     report = {
         "time": dt.datetime.now(dt.timezone.utc).astimezone().isoformat(),
         "pid": pid,
-        "user": pwd.getpwuid(uid).pw_name,
+        "user": user_name(uid),
         "threads": integer_kib(fields, "Threads"),
         "cgroup": group,
         "cgroup_memory": cgroup_memory(group),
         "status_kib": {key: integer_kib(fields, key) for key in ("VmRSS", "VmSwap", "RssAnon", "RssFile", "RssShmem")},
         "rollup_kib": totals,
         "map_groups_bytes": dict(groups),
+        "anonymous_mappings_bytes": anonymous_mappings(pid),
+        "memory_current": cgroup_memory(group).get("memory.current", 0),
+        "memory_swap_current": cgroup_memory(group).get("memory.swap.current", 0),
+        "swap_kib": integer_kib(fields, "VmSwap"),
+        "task_children": [row for row in children(pid) if "pipeline-task" in row.get("args", "")],
         "model_files": models,
         "swap_by_mapping": swapped[:100],
         "open_model_files": open_files(pid, models),
         "children": children(pid),
     }
+    failures: list[str] = []
+    if args.compare:
+        before = json.loads(args.compare.read_text(encoding="utf-8"))
+        comparison = diff(before, report)
+        failures = verdict(comparison)
+        report["comparison"] = comparison
+        report["verdict"] = failures
     args.output.mkdir(parents=True, exist_ok=True)
     write_text(args.output / "report.json", json.dumps(report, indent=2) + "\n")
     write_text(args.output / "status.txt", read_text(Path(f"/proc/{pid}/status")))
     write_text(args.output / "smaps_rollup.txt", read_text(Path(f"/proc/{pid}/smaps_rollup")))
     write_text(args.output / "maps.txt", "".join(f"{size}\t{path}\n" for path, size in maps))
+    if args.compare:
+        acceptance = ["acceptance:", *([f"  FAIL {row}" for row in failures] or ["  all criteria held"])]
+    else:
+        acceptance = []
     lines = [
         f"pid={pid} user={report['user']} threads={report['threads']}",
         f"PSS={mebibytes(totals.get('Pss', 0))} SwapPss={mebibytes(totals.get('SwapPss', 0))}",
         "mapped file groups:",
         *(f"  {name}={size / 1024**2:,.1f} MiB" for name, size in sorted(groups.items(), key=lambda item: item[1], reverse=True)),
+        *acceptance,
         "target model files:",
         *(f"  {item['model']}={int(item['bytes']) / 1024**2:,.1f} MiB {item['path']}" for item in models),
         "open target model files:",

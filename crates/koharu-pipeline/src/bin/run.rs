@@ -178,8 +178,8 @@ async fn main() -> Result<()> {
     )?;
     let snapshot = session.snapshot();
     let mut committer = SessionCommitter(&mut session);
-    let task = pipeline
-        .execute(
+    let release = pipeline
+        .execute_in_subprocess(
             snapshot,
             Request {
                 operation: Operation::Full,
@@ -193,8 +193,8 @@ async fn main() -> Result<()> {
             },
             &mut committer,
         )
-        .await;
-    let report = task.release_resources().await.result?;
+        .await?;
+    let report = release.result?;
     eprintln!("pipeline finished in {:.2}s", report.elapsed.as_secs_f64());
 
     let renderer = Renderer::new()?;

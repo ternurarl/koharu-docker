@@ -74,6 +74,25 @@ impl Pipeline {
         self.resources.subscribe()
     }
 
+    /// Runs one task in a subprocess and returns after that subprocess exits.
+    ///
+    /// The subprocess loads the models, commits each stage into a scratch copy
+    /// of `snapshot`, and reports the committed patches back. `committer`
+    /// applies those patches to the caller's session, so the caller's session
+    /// keeps its own lock and its own undo history. The subprocess exits once
+    /// it has released its models and image cache, which is the point where the
+    /// operating system reclaims the memory the model runtimes retain.
+    #[tracing::instrument(skip_all)]
+    pub async fn execute_in_subprocess(
+        &self,
+        snapshot: Snapshot,
+        request: Request,
+        committer: &mut dyn Committer,
+    ) -> Result<TaskRelease> {
+        let _execution = self.execution.lock().await;
+        crate::worker::execute(snapshot, request, committer).await
+    }
+
     #[tracing::instrument(skip_all)]
     pub async fn execute(
         &self,

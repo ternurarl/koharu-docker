@@ -66,6 +66,53 @@ impl Session {
         Self::assemble(storage, state).await
     }
 
+    /// Opens a session from a scene checkpoint and the blob bytes it names.
+    ///
+    /// `checkpoint` is the payload [`Session::open`] reads out of a project
+    /// file, and `blobs` supplies every blob that payload references. The
+    /// session stands on its own and never touches the project the checkpoint
+    /// was copied from, so a task subprocess can work on a copy while the
+    /// parent keeps the project's lock.
+    pub async fn from_checkpoint(
+        path: impl AsRef<Path>,
+        checkpoint: &[u8],
+        blobs: impl IntoIterator<Item = (koharu_storage::BlobId, Bytes)>,
+    ) -> Result<Self> {
+        let stored: StoredState = revision::from_slice(checkpoint)?;
+        let document = koharu_storage::DocumentId::new();
+        // The copied scene has its own document identity. Keeping the source
+        // document would make the copy's patches apply to the parent's
+        // project, so the two sessions could no longer be told apart.
+        let scene = State::from_checkpoint(
+            document,
+            koharu_storage::Revision::ZERO
+                .next()
+                .ok_or_else(|| Error::invalid("project revision overflow"))?,
+            stored,
+        )?;
+        let empty = State::empty(document);
+        let storage = koharu_storage::Session::create(
+            path,
+            document,
+            Bytes::from(encode_checkpoint(&empty)?),
+        )
+        .await?;
+        let base = storage.load().await?;
+        let proposed = base.update(
+            scene.revision,
+            Bytes::from(encode_checkpoint(&scene)?),
+            scene.referenced_blobs(),
+            blobs,
+        )?;
+        let saved = storage.save(&proposed).await?;
+        let current = Snapshot::new(Arc::new(scene), saved)?;
+        Ok(Self {
+            storage,
+            current,
+            history: BTreeMap::new(),
+        })
+    }
+
     #[must_use]
     pub fn project_id(&self) -> ProjectId {
         ProjectId(self.current.state.document)
