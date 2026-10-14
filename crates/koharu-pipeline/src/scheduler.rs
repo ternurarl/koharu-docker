@@ -235,7 +235,10 @@ mod tests {
         let mut scheduler = Scheduler::new(&pages, &stages);
         let busy = BTreeSet::new();
 
-        assert_eq!(scheduler.start_next(&busy), Some((pages[0], Stage::Detection)));
+        assert_eq!(
+            scheduler.start_next(&busy),
+            Some((pages[0], Stage::Detection))
+        );
         scheduler.finish_stage(Stage::Detection);
         assert_eq!(
             scheduler.start_next(&busy),

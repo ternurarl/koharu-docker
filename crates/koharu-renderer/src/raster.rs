@@ -175,11 +175,7 @@ impl Rasterizer {
     /// Visible, axis-aligned image layers with decoded pixels are composited on the CPU;
     /// text runs (and rotated/skewed image-layer fallbacks) are rendered by Vello with a
     /// transparent background and overlaid in place so ordering is never rearranged.
-    fn rasterize_layered(
-        &self,
-        frame: &crate::Frame,
-        options: RasterOptions,
-    ) -> Result<RgbaImage> {
+    fn rasterize_layered(&self, frame: &crate::Frame, options: RasterOptions) -> Result<RgbaImage> {
         let (width, height) = frame.size();
         if width == 0 || height == 0 {
             bail!("invalid render surface {width}x{height}");
@@ -315,13 +311,7 @@ impl Rasterizer {
 
     /// Renders one accumulated run at the (already supersampled) target size with a
     /// transparent background; the whole canvas is downsampled once at the end instead.
-    fn render_run(
-        &self,
-        scene: &Scene,
-        width: u32,
-        height: u32,
-        factor: u32,
-    ) -> Result<RgbaImage> {
+    fn render_run(&self, scene: &Scene, width: u32, height: u32, factor: u32) -> Result<RgbaImage> {
         let scaled;
         let scene = if factor == 1 {
             scene

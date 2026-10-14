@@ -40,6 +40,11 @@ pub(crate) struct Execution<'a> {
     released: Vec<(Stage, bool)>,
 }
 
+pub(crate) struct RunOutcome {
+    pub(crate) result: std::result::Result<Report, PipelineError>,
+    pub(crate) images: Vec<Arc<ImageCache>>,
+}
+
 impl<'a> Execution<'a> {
     pub(crate) fn new(
         runner: Arc<StageRunner>,
@@ -95,10 +100,11 @@ impl<'a> Execution<'a> {
         })
     }
 
-    pub(crate) async fn run(mut self) -> std::result::Result<Report, PipelineError> {
+    pub(crate) async fn run(mut self) -> RunOutcome {
         if self.stopped() {
             self.release_active_batch().await;
-            return Ok(self.report(RunStatus::Stopped));
+            let result = Ok(self.report(RunStatus::Stopped));
+            return self.finish(result);
         }
 
         self.resources.start();
@@ -116,9 +122,9 @@ impl<'a> Execution<'a> {
             };
             let completed_stage = completion.stage;
             self.busy_stages.remove(&completion.stage);
-            let batch_drained = self
-                .active_batch
-                .is_some_and(|stage| stage == completed_stage && !self.busy_stages.contains(&stage));
+            let batch_drained = self.active_batch.is_some_and(|stage| {
+                stage == completed_stage && !self.busy_stages.contains(&stage)
+            });
             if self.stopped() || self.failure.is_some() {
                 continue;
             }
@@ -136,7 +142,15 @@ impl<'a> Execution<'a> {
             self.finish_batch(stage);
         }
         self.release_active_batch().await;
-        self.finalize()
+        let result = self.finalize();
+        self.finish(result)
+    }
+
+    fn finish(self, result: std::result::Result<Report, PipelineError>) -> RunOutcome {
+        RunOutcome {
+            result,
+            images: self.images.into_values().collect(),
+        }
     }
 
     async fn take_ready_job(&mut self) -> Option<StageJob> {
@@ -266,6 +280,9 @@ impl<'a> Execution<'a> {
     }
 
     fn clear_images(&mut self) {
+        for images in self.images.values() {
+            images.clear();
+        }
         self.images.clear();
     }
 
@@ -273,9 +290,9 @@ impl<'a> Execution<'a> {
         self.stop.stopped()
     }
 
-    fn finalize(mut self) -> std::result::Result<Report, PipelineError> {
+    fn finalize(&mut self) -> std::result::Result<Report, PipelineError> {
         if let Some(mut error) = self.failure.take() {
-            error.released_models.extend(self.released);
+            error.released_models.extend(self.released.iter().copied());
             return Err(error);
         }
         if !self.stopped() && self.completed != self.scheduler.total() {

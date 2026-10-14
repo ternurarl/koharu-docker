@@ -6,8 +6,10 @@ use koharu_config::Config;
 use koharu_scene::Snapshot;
 
 use crate::{
-    Committer, PipelineConfig, PipelineError, Report, Request, ResourceSnapshot,
-    execution::Execution, resources::ResourceMonitor, stage_runner::StageRunner,
+    Committer, PipelineConfig, PipelineError, Report, Request, ResourceSnapshot, Stage,
+    execution::{Execution, RunOutcome},
+    resources::ResourceMonitor,
+    stage_runner::StageRunner,
 };
 
 #[derive(Clone)]
@@ -78,16 +80,53 @@ impl Pipeline {
         snapshot: Snapshot,
         request: Request,
         committer: &mut dyn Committer,
-    ) -> std::result::Result<Report, PipelineError> {
+    ) -> TaskExecution {
         let _execution = self.execution.lock().await;
-        Execution::new(
-            self.current.load_full(),
+        let runner = self.current.load_full();
+        let RunOutcome { result, images } = match Execution::new(
+            runner.clone(),
             self.resources.clone(),
             snapshot,
             request,
             committer,
-        )?
-        .run()
-        .await
+        ) {
+            Ok(execution) => execution.run().await,
+            Err(error) => RunOutcome {
+                result: Err(error),
+                images: Vec::new(),
+            },
+        };
+        TaskExecution {
+            result,
+            runner,
+            images,
+        }
     }
+}
+
+pub struct TaskExecution {
+    result: std::result::Result<Report, PipelineError>,
+    runner: Arc<StageRunner>,
+    images: Vec<Arc<crate::ImageCache>>,
+}
+
+impl TaskExecution {
+    pub async fn release_resources(self) -> TaskRelease {
+        let released_models = self.runner.release_task_models().await;
+        for images in &self.images {
+            images.clear();
+        }
+        let image_cache_items = self.images.iter().map(|images| images.len()).sum();
+        TaskRelease {
+            result: self.result,
+            released_models,
+            image_cache_items,
+        }
+    }
+}
+
+pub struct TaskRelease {
+    pub result: std::result::Result<Report, PipelineError>,
+    pub released_models: Vec<(Stage, bool)>,
+    pub image_cache_items: usize,
 }

@@ -21,7 +21,7 @@ pub use config::{
     DetectionModel, InpaintingModel, OcrModel, PipelineConfig, ProcessorConfig, TranslationConfig,
 };
 pub use error::{ErrorKind, PipelineError};
-pub use pipeline::Pipeline;
+pub use pipeline::{Pipeline, TaskExecution, TaskRelease};
 pub use progress::{Progress, ProgressSink};
 pub use report::{Committer, Report, RunStatus, StageOutput};
 pub use request::{InpaintingMask, Operation, Request, StopToken};

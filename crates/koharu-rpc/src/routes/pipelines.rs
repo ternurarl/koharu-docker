@@ -51,7 +51,9 @@ async fn start_pipeline(
 
     let operation_id = Uuid::new_v4().to_string();
     let stop = StopToken::default();
-    app.cancels.lock().insert(operation_id.clone(), stop.clone());
+    app.cancels
+        .lock()
+        .insert(operation_id.clone(), stop.clone());
     app.jobs.lock().insert(
         operation_id.clone(),
         JobSummary {
@@ -92,7 +94,9 @@ async fn start_pipeline(
                         let progress = progress.lock();
                         Some((progress.0, progress.1, Some(page), Some(stage), Some(model)))
                     }
-                    Progress::Finished { page, stage, model, .. } => {
+                    Progress::Finished {
+                        page, stage, model, ..
+                    } => {
                         let mut progress = progress.lock();
                         progress.0 = progress.0.saturating_add(1).min(progress.1);
                         Some((progress.0, progress.1, Some(page), Some(stage), Some(model)))
@@ -108,7 +112,8 @@ async fn start_pipeline(
                     return;
                 };
                 let stage_name = stage.map(|stage| stage.to_string());
-                let overall_percent = (total > 0).then(|| (completed as f32 / total as f32) * 100.0);
+                let overall_percent =
+                    (total > 0).then(|| (completed as f32 / total as f32) * 100.0);
                 {
                     let mut jobs = progress_app.jobs.lock();
                     if let Some(job) = jobs.get_mut(&progress_id) {
@@ -147,7 +152,11 @@ async fn start_pipeline(
         }
 
         let mut committer = SessionCommitter { app: app_c.clone() };
-        let result = app_c.pipeline.execute(snapshot, request, &mut committer).await;
+        let task = app_c
+            .pipeline
+            .execute(snapshot, request, &mut committer)
+            .await;
+        let result = task.release_resources().await.result;
         let (status, error) = match result {
             Ok(report) if report.status == RunStatus::Stopped => (JobStatus::Cancelled, None),
             Ok(_) => (JobStatus::Completed, None),
@@ -162,11 +171,13 @@ async fn start_pipeline(
             job.status = status;
             job.error = error.clone();
         }
-        app_c.bus.publish(AppEvent::JobFinished(crate::state::JobFinished {
-            id: op_id_c.clone(),
-            status,
-            error,
-        }));
+        app_c
+            .bus
+            .publish(AppEvent::JobFinished(crate::state::JobFinished {
+                id: op_id_c.clone(),
+                status,
+                error,
+            }));
     });
 
     Ok(Json(StartPipelineResponse { operation_id }))

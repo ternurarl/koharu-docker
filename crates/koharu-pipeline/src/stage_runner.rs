@@ -51,6 +51,14 @@ impl StageRunner {
         self.stages.release(stage).await
     }
 
+    pub(crate) async fn release_task_models(&self) -> Vec<(Stage, bool)> {
+        let mut released = Vec::with_capacity(3);
+        for stage in [Stage::Detection, Stage::Ocr, Stage::Inpainting] {
+            released.push((stage, self.stages.release(stage).await));
+        }
+        released
+    }
+
     async fn run_with_recovery(
         &self,
         job: &StageJob,
@@ -135,7 +143,8 @@ impl StageRunner {
             ErrorKind::ModelLoad => format!("failed to load {model}"),
             _ => format!("{model} failed"),
         };
-        let mut error = PipelineError::new(failure.kind, Some(stage), failure.error.context(message));
+        let mut error =
+            PipelineError::new(failure.kind, Some(stage), failure.error.context(message));
         if unloaded {
             error.released_models.push((stage, true));
         }

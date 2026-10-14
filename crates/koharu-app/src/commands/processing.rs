@@ -212,7 +212,8 @@ pub(crate) async fn process(
             handle: task_handle.clone(),
             revisions: Vec::new(),
         };
-        let result = pipeline.execute(snapshot, request, &mut committer).await;
+        let task = pipeline.execute(snapshot, request, &mut committer).await;
+        let result = task.release_resources().await.result;
         let (stopped, error) = match result {
             Ok(report) => (report.status == RunStatus::Stopped, None),
             Err(error) => {

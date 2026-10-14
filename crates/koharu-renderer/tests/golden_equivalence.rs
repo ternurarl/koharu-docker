@@ -50,7 +50,9 @@ fn asset(bytes: Arc<[u8]>, width: u32, height: u32) -> AssetInput {
 }
 
 fn golden_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests").join("golden")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("golden")
 }
 
 /// Loads a baseline PNG **read-only**; the golden directory is never written.
@@ -147,9 +149,8 @@ fn src_over(dst: [u8; 4], src: [u8; 4]) -> [u8; 4] {
     if out_a <= 0.0 {
         return [0, 0, 0, 0];
     }
-    let channel = |s: u8, d: u8| {
-        ((f64::from(s) * sa + f64::from(d) * da * (1.0 - sa)) / out_a).round() as u8
-    };
+    let channel =
+        |s: u8, d: u8| ((f64::from(s) * sa + f64::from(d) * da * (1.0 - sa)) / out_a).round() as u8;
     [
         channel(src[0], dst[0]),
         channel(src[1], dst[1]),
@@ -208,9 +209,24 @@ async fn g1_source_cleanup_matches_golden_within_one() {
         "G1 has {over} pixels beyond per-channel diff 1 (max {max} at {worst:?})"
     );
     // manifest.md 抽样点。
-    assert_near(current.get_pixel(0, 0).0, [125, 25, 110, 255], 1, "G1 (0,0)");
-    assert_near(current.get_pixel(10, 10).0, [200, 100, 50, 255], 1, "G1 (10,10)");
-    assert_near(current.get_pixel(63, 95).0, [125, 25, 110, 255], 1, "G1 (63,95)");
+    assert_near(
+        current.get_pixel(0, 0).0,
+        [125, 25, 110, 255],
+        1,
+        "G1 (0,0)",
+    );
+    assert_near(
+        current.get_pixel(10, 10).0,
+        [200, 100, 50, 255],
+        1,
+        "G1 (10,10)",
+    );
+    assert_near(
+        current.get_pixel(63, 95).0,
+        [125, 25, 110, 255],
+        1,
+        "G1 (63,95)",
+    );
 }
 
 /// G2: same as G1 but the Cleanup layer carries Visibility { opacity: 0.5 }.
@@ -227,8 +243,18 @@ async fn g2_cleanup_opacity_matches_golden_within_one() {
     );
     // manifest.md 抽样点。
     assert_near(current.get_pixel(0, 0).0, [68, 23, 155, 255], 1, "G2 (0,0)");
-    assert_near(current.get_pixel(10, 10).0, [105, 60, 125, 255], 1, "G2 (10,10)");
-    assert_near(current.get_pixel(63, 95).0, [68, 23, 155, 255], 1, "G2 (63,95)");
+    assert_near(
+        current.get_pixel(10, 10).0,
+        [105, 60, 125, 255],
+        1,
+        "G2 (10,10)",
+    );
+    assert_near(
+        current.get_pixel(63, 95).0,
+        [68, 23, 155, 255],
+        1,
+        "G2 (63,95)",
+    );
 }
 
 /// G3: 16x16 gradient stretched into a 64x64 rectangle over a checkerboard.
@@ -259,16 +285,9 @@ async fn g3_embedded_scaled_matches_golden_structurally() {
         .snapshot()
         .patch(|edit| {
             let created = edit.add_page(PageDraft::new("page", 128.0, 128.0), At::End)?;
-            edit.set_asset(
-                created,
-                &source_role,
-                asset(encode_png(checker), 128, 128),
-            )?;
+            edit.set_asset(created, &source_role, asset(encode_png(checker), 128, 128))?;
             let embedded = edit.add_entity(created, At::End)?;
-            edit.set(
-                embedded,
-                &Geometry::rectangle(32.0, 32.0, 64.0, 64.0),
-            )?;
+            edit.set(embedded, &Geometry::rectangle(32.0, 32.0, 64.0, 64.0))?;
             edit.set_asset(embedded, &source_role, asset(encode_png(gradient), 16, 16))?;
             page = Some(created);
             Ok(())
@@ -294,10 +313,7 @@ async fn g3_embedded_scaled_matches_golden_structurally() {
     let mut all_worst = (0, 0);
     for y in 0..128_u32 {
         for x in 0..128_u32 {
-            let diff = pixel_diff(
-                current.get_pixel(x, y).0,
-                golden.get_pixel(x, y).0,
-            );
+            let diff = pixel_diff(current.get_pixel(x, y).0, golden.get_pixel(x, y).0);
             all_sum += u64::from(diff);
             if diff > all_max {
                 all_max = diff;
@@ -349,10 +365,7 @@ async fn g3_embedded_scaled_matches_golden_structurally() {
     );
     // 结构 2:manifest 抽样点(嵌入渐变内)与基线一致(允许 ≤16 滤波差)。
     for (x, y) in [(33, 33), (64, 64), (95, 95)] {
-        let diff = pixel_diff(
-            current.get_pixel(x, y).0,
-            golden.get_pixel(x, y).0,
-        );
+        let diff = pixel_diff(current.get_pixel(x, y).0, golden.get_pixel(x, y).0);
         assert!(
             diff <= 16,
             "G3: embedded gradient sample ({x},{y}) differs too much: current {:?} vs golden {:?} (diff {diff})",
@@ -433,7 +446,11 @@ async fn g4_text_over_images_matches_golden() {
     assert_eq!(current.dimensions(), golden.dimensions());
 
     let background = src_over([10, 20, 200, 255], [240, 30, 20, 128]);
-    assert_eq!(background, [125, 25, 110, 255], "manifest background composite");
+    assert_eq!(
+        background,
+        [125, 25, 110, 255],
+        "manifest background composite"
+    );
     let dot = [200_u8, 100, 50, 255];
     const GLYPH_TOLERANCE: u8 = 8;
 
@@ -451,8 +468,7 @@ async fn g4_text_over_images_matches_golden() {
         let current_px = pixel.0;
         let golden_px = golden.get_pixel(x, y).0;
         let diff = pixel_diff(current_px, golden_px);
-        let golden_flat =
-            pixel_diff(golden_px, background) <= 1 || pixel_diff(golden_px, dot) <= 1;
+        let golden_flat = pixel_diff(golden_px, background) <= 1 || pixel_diff(golden_px, dot) <= 1;
         let current_flat =
             pixel_diff(current_px, background) <= 1 || pixel_diff(current_px, dot) <= 1;
         if golden_flat && current_flat {
@@ -472,7 +488,10 @@ async fn g4_text_over_images_matches_golden() {
                 glyph_over += 1;
             }
         }
-        if u32::from(golden_px[0]) < 40 && u32::from(golden_px[1]) < 40 && u32::from(golden_px[2]) < 40 {
+        if u32::from(golden_px[0]) < 40
+            && u32::from(golden_px[1]) < 40
+            && u32::from(golden_px[2]) < 40
+        {
             golden_dark += 1;
         }
         if u32::from(current_px[0]) < 40
@@ -509,9 +528,24 @@ async fn g4_text_over_images_matches_golden() {
         "G4: near-black stroke pixel count drifted too far: golden={golden_dark}, current={current_dark}"
     );
     // manifest.md 抽样点。
-    assert_near(current.get_pixel(0, 0).0, [125, 25, 110, 255], 1, "G4 (0,0) background");
-    assert_near(current.get_pixel(10, 10).0, [200, 100, 50, 255], 1, "G4 (10,10) dot");
-    assert_near(current.get_pixel(63, 95).0, [125, 25, 110, 255], 1, "G4 (63,95) background");
+    assert_near(
+        current.get_pixel(0, 0).0,
+        [125, 25, 110, 255],
+        1,
+        "G4 (0,0) background",
+    );
+    assert_near(
+        current.get_pixel(10, 10).0,
+        [200, 100, 50, 255],
+        1,
+        "G4 (10,10) dot",
+    );
+    assert_near(
+        current.get_pixel(63, 95).0,
+        [125, 25, 110, 255],
+        1,
+        "G4 (63,95) background",
+    );
     let (glyph_x, glyph_y) = (18, 7);
     let glyph_diff = pixel_diff(
         current.get_pixel(glyph_x, glyph_y).0,

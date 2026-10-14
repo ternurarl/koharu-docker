@@ -50,4 +50,18 @@ impl ImageCache {
             .clone();
         Ok(Some(image))
     }
+
+    pub(crate) fn clear(&self) {
+        self.decoded
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clear();
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.decoded
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .len()
+    }
 }

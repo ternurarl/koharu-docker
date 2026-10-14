@@ -163,12 +163,13 @@ impl KoharuHost {
             progress: None,
             inpainting_mask: None,
         };
-        let result = self
+        let task = self
             .handle
             .state::<koharu_pipeline::Pipeline>()
             .execute(snapshot, request, &mut committer)
             .await;
         watcher.abort();
+        let result = task.release_resources().await.result;
         self.handle.state::<Processing>().stops.lock().remove(&job);
         let report = result.map_err(|error| anyhow!(error))?;
         if report.status == RunStatus::Stopped {
