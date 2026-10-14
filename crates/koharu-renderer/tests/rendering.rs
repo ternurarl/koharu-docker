@@ -183,9 +183,8 @@ fn src_over(dst: [u8; 4], src: [u8; 4]) -> [u8; 4] {
     if out_a <= 0.0 {
         return [0, 0, 0, 0];
     }
-    let channel = |s: u8, d: u8| {
-        ((f64::from(s) * sa + f64::from(d) * da * (1.0 - sa)) / out_a).round() as u8
-    };
+    let channel =
+        |s: u8, d: u8| ((f64::from(s) * sa + f64::from(d) * da * (1.0 - sa)) / out_a).round() as u8;
     [
         channel(src[0], dst[0]),
         channel(src[1], dst[1]),
@@ -224,15 +223,17 @@ async fn sequential_render_rasterize_keeps_image_layers_on_every_page() {
     ];
 
     let source = AssetRole::new("source").unwrap();
-    let asset_meta = |color: [u8; 4]| AssetInput::new(
-        png(WIDTH, HEIGHT, color),
-        "image/png",
-        AssetMetadata {
-            width: Some(WIDTH),
-            height: Some(HEIGHT),
-            attributes: BTreeMap::new(),
-        },
-    );
+    let asset_meta = |color: [u8; 4]| {
+        AssetInput::new(
+            png(WIDTH, HEIGHT, color),
+            "image/png",
+            AssetMetadata {
+                width: Some(WIDTH),
+                height: Some(HEIGHT),
+                attributes: BTreeMap::new(),
+            },
+        )
+    };
     let mut session = Session::memory().await.unwrap();
     let mut pages: Vec<koharu_scene::EntityId> = Vec::new();
     let patch = session
@@ -241,11 +242,7 @@ async fn sequential_render_rasterize_keeps_image_layers_on_every_page() {
             for index in 0..PAGES {
                 let (src, clean) = regression_page_colors(index);
                 let created = edit.add_page(
-                    PageDraft::new(
-                        format!("page{index}"),
-                        f64::from(WIDTH),
-                        f64::from(HEIGHT),
-                    ),
+                    PageDraft::new(format!("page{index}"), f64::from(WIDTH), f64::from(HEIGHT)),
                     At::End,
                 )?;
                 edit.set_asset(created, &source, asset_meta(src))?;
@@ -309,14 +306,12 @@ async fn sequential_render_rasterize_keeps_image_layers_on_every_page() {
             for channel in 0..3 {
                 let diff = i32::from(pixel[channel]) - i32::from(expected[channel]);
                 assert!(
-                diff.abs() <= 1,
+                    diff.abs() <= 1,
                     "page {index} pixel ({x},{y}): got {pixel:?}, expected src-over \
                      {expected:?} (src {src:?} over-composited by cleanup {clean:?})"
                 );
             }
         }
-        println!(
-            "regression page {index}: sampled {SAMPLES:?} all opaque, expected {expected:?}"
-        );
+        println!("regression page {index}: sampled {SAMPLES:?} all opaque, expected {expected:?}");
     }
 }

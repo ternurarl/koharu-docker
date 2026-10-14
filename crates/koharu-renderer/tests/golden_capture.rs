@@ -47,7 +47,9 @@ fn asset(bytes: Arc<[u8]>, width: u32, height: u32) -> AssetInput {
 }
 
 fn golden_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests").join("golden")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("golden")
 }
 
 async fn capture(name: &str, session: &mut Session, page: koharu_scene::EntityId) -> Raster {
@@ -60,16 +62,17 @@ async fn capture(name: &str, session: &mut Session, page: koharu_scene::EntityId
         .unwrap();
     let dir = golden_dir();
     std::fs::create_dir_all(&dir).unwrap();
-    raster
-        .image
-        .save(dir.join(format!("{name}.png")))
-        .unwrap();
+    raster.image.save(dir.join(format!("{name}.png"))).unwrap();
     raster
 }
 
 /// Full-page source + full-page translucent Cleanup layer with one opaque
 /// dot at (10, 10). Shared builder for G1/G2/G4.
-async fn build_source_with_cleanup(width: u32, height: u32, with_visibility: bool) -> (Session, koharu_scene::EntityId) {
+async fn build_source_with_cleanup(
+    width: u32,
+    height: u32,
+    with_visibility: bool,
+) -> (Session, koharu_scene::EntityId) {
     let source_role = AssetRole::new("source").unwrap();
     let mut cleanup = image::RgbaImage::from_pixel(width, height, image::Rgba([240, 30, 20, 128]));
     cleanup.put_pixel(10, 10, image::Rgba([200, 100, 50, 255]));
@@ -157,12 +160,7 @@ async fn g3_embedded_scaled() {
     // 16x16 gradient embedded image.
     let mut gradient = image::RgbaImage::new(16, 16);
     for (x, y, pixel) in gradient.enumerate_pixels_mut() {
-        *pixel = image::Rgba([
-            (x as u8) * 16,
-            (y as u8) * 16,
-            128,
-            255,
-        ]);
+        *pixel = image::Rgba([(x as u8) * 16, (y as u8) * 16, 128, 255]);
     }
     let mut session = Session::memory().await.unwrap();
     let mut page = None;
@@ -170,16 +168,9 @@ async fn g3_embedded_scaled() {
         .snapshot()
         .patch(|edit| {
             let created = edit.add_page(PageDraft::new("page", 128.0, 128.0), At::End)?;
-            edit.set_asset(
-                created,
-                &source_role,
-                asset(encode_png(checker), 128, 128),
-            )?;
+            edit.set_asset(created, &source_role, asset(encode_png(checker), 128, 128))?;
             let embedded = edit.add_entity(created, At::End)?;
-            edit.set(
-                embedded,
-                &Geometry::rectangle(32.0, 32.0, 64.0, 64.0),
-            )?;
+            edit.set(embedded, &Geometry::rectangle(32.0, 32.0, 64.0, 64.0))?;
             edit.set_asset(embedded, &source_role, asset(encode_png(gradient), 16, 16))?;
             page = Some(created);
             Ok(())

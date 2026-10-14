@@ -110,9 +110,14 @@ impl Canvas {
                     let src_x = (x - origin_x) as usize;
                     let offset = (src_y * src_width as usize + src_x) * 4;
                     blend_pixel(
-                        self, x as u32, y as u32,
-                        pixels[offset], pixels[offset + 1], pixels[offset + 2],
-                        pixels[offset + 3], opacity,
+                        self,
+                        x as u32,
+                        y as u32,
+                        pixels[offset],
+                        pixels[offset + 1],
+                        pixels[offset + 2],
+                        pixels[offset + 3],
+                        opacity,
                     );
                 }
             }
@@ -143,9 +148,14 @@ impl Canvas {
                 }
                 let offset = (src_y * src_width as usize + src_x as usize) * 4;
                 blend_pixel(
-                    self, x as u32, y as u32,
-                    pixels[offset], pixels[offset + 1], pixels[offset + 2],
-                    pixels[offset + 3], opacity,
+                    self,
+                    x as u32,
+                    y as u32,
+                    pixels[offset],
+                    pixels[offset + 1],
+                    pixels[offset + 2],
+                    pixels[offset + 3],
+                    opacity,
                 );
             }
         }
@@ -168,8 +178,13 @@ impl Canvas {
             for x in 0..width {
                 let offset = (y as usize * src_width as usize + x as usize) * 4;
                 blend_pixel(
-                    self, x, y,
-                    raw[offset], raw[offset + 1], raw[offset + 2], raw[offset + 3],
+                    self,
+                    x,
+                    y,
+                    raw[offset],
+                    raw[offset + 1],
+                    raw[offset + 2],
+                    raw[offset + 3],
                     opacity,
                 );
             }
@@ -208,12 +223,12 @@ fn blend_pixel(canvas: &mut Canvas, x: u32, y: u32, sr: u8, sg: u8, sb: u8, sa: 
     let out_alpha = source_alpha + (da * inv + 127) / 255;
     let denominator = 255 * out_alpha;
     let half = denominator / 2;
-    let out_r = (u32::from(sr) * source_alpha * 255 + u32::from(dst[0]) * da * inv + half)
-        / denominator;
-    let out_g = (u32::from(sg) * source_alpha * 255 + u32::from(dst[1]) * da * inv + half)
-        / denominator;
-    let out_b = (u32::from(sb) * source_alpha * 255 + u32::from(dst[2]) * da * inv + half)
-        / denominator;
+    let out_r =
+        (u32::from(sr) * source_alpha * 255 + u32::from(dst[0]) * da * inv + half) / denominator;
+    let out_g =
+        (u32::from(sg) * source_alpha * 255 + u32::from(dst[1]) * da * inv + half) / denominator;
+    let out_b =
+        (u32::from(sb) * source_alpha * 255 + u32::from(dst[2]) * da * inv + half) / denominator;
     dst[0] = out_r.min(255) as u8;
     dst[1] = out_g.min(255) as u8;
     dst[2] = out_b.min(255) as u8;
@@ -253,7 +268,8 @@ mod tests {
             }
         }
         // Exact src-over onto a partially transparent destination pixel.
-        let mut canvas = Canvas::from_rgba(RgbaImage::from_pixel(1, 1, image::Rgba([0, 0, 255, 0])));
+        let mut canvas =
+            Canvas::from_rgba(RgbaImage::from_pixel(1, 1, image::Rgba([0, 0, 255, 0])));
         let src = decoded(1, 1, [80, 90, 100, 128]);
         canvas.overlay_decoded(&src, 1.0, 1.0, 0.0, 0.0, 1.0);
         assert_eq!(pixel(&canvas, 0, 0), [80, 90, 100, 128]);
@@ -295,7 +311,11 @@ mod tests {
         for y in 0..4 {
             for x in 0..4 {
                 let inside = (1..3).contains(&x) && (1..3).contains(&y);
-                let expected = if inside { [200, 0, 0, 255] } else { [0, 0, 0, 0] };
+                let expected = if inside {
+                    [200, 0, 0, 255]
+                } else {
+                    [0, 0, 0, 0]
+                };
                 assert_eq!(pixel(&canvas, x, y), expected, "at ({x}, {y})");
             }
         }
@@ -307,7 +327,9 @@ mod tests {
         let src = DecodedImage {
             width: 2,
             height: 2,
-            pixels: Arc::from(vec![255_u8, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 0, 255]),
+            pixels: Arc::from(vec![
+                255_u8, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 0, 255,
+            ]),
         };
         // Shifted one pixel left/up: source spans dest [-1, 1) on each axis,
         // so only dest (0,0) samples an in-bounds source texel (1,1); dest
