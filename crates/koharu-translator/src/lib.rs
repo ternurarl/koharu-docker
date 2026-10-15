@@ -2,7 +2,6 @@
 
 mod backend;
 mod error;
-mod json;
 mod language;
 mod local;
 mod model;
@@ -10,7 +9,7 @@ mod prompt;
 mod provider;
 mod remote;
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use koharu_ml::Device;
 
@@ -62,8 +61,8 @@ impl Translator {
     }
 
     #[must_use]
-    pub fn supports_vision(selection: &ModelSelection) -> bool {
-        selection.vision
+    pub fn supports_vision(selection: &ModelSelection, generation: &GenerationConfig) -> bool {
+        generation.vision.unwrap_or(false)
             && (selection.provider != Provider::Local || local::supports_vision(selection))
     }
 
@@ -101,7 +100,6 @@ impl Translator {
         Ok(())
     }
 
-    #[tracing::instrument(skip_all)]
     pub async fn translate(
         &self,
         selection: &ModelSelection,
@@ -114,7 +112,9 @@ impl Translator {
             return Ok((provider_id, request.segments));
         }
 
-        if Self::supports_vision(selection) {
+        let generation = generation.for_model(selection);
+
+        if Self::supports_vision(selection, &generation) {
             request.prepare_image()?;
         } else {
             request.remove_image();
@@ -143,11 +143,19 @@ impl Translator {
 
     #[tracing::instrument(skip_all)]
     pub async fn models() -> anyhow::Result<Vec<Model>> {
+        static CLIENT: tokio::sync::OnceCell<reqwest::Client> = tokio::sync::OnceCell::const_new();
+
         let providers = ProvidersConfig::load()?;
         let providers = providers.read()?.clone();
-        let client = koharu_runtime::http_client()?;
+        let client = CLIENT
+            .get_or_try_init(|| async {
+                reqwest::Client::builder()
+                    .timeout(Duration::from_secs(5))
+                    .build()
+            })
+            .await?;
         let mut models = local::models();
-        models.extend(remote::models(&client, &providers).await);
+        models.extend(remote::models(client, &providers).await);
         Ok(models)
     }
 
@@ -176,29 +184,39 @@ impl Translator {
 mod tests {
     use super::*;
 
-    fn local_selection(model: &str, vision: bool) -> ModelSelection {
+    fn local_selection(model: &str) -> ModelSelection {
         ModelSelection {
             provider: Provider::Local,
             model: Some(model.to_owned()),
             quantization: None,
-            vision,
+            vision: true,
+            reasoning: true,
         }
     }
 
     #[test]
-    fn local_vision_requires_capability_and_selection() {
-        assert!(Translator::supports_vision(&local_selection(
-            "gemma4-e2b-it",
-            true
-        )));
-        assert!(!Translator::supports_vision(&local_selection(
-            "gemma4-e2b-it",
-            false
-        )));
-        assert!(!Translator::supports_vision(&local_selection(
-            "lfm2.5-1.2b-instruct",
-            true
-        )));
+    fn local_vision_requires_capability_and_generation_setting() {
+        assert!(Translator::supports_vision(
+            &local_selection("gemma4-e2b-it"),
+            &GenerationConfig {
+                vision: Some(true),
+                ..GenerationConfig::default()
+            }
+        ));
+        assert!(!Translator::supports_vision(
+            &local_selection("gemma4-e2b-it"),
+            &GenerationConfig {
+                vision: Some(false),
+                ..GenerationConfig::default()
+            }
+        ));
+        assert!(!Translator::supports_vision(
+            &local_selection("lfm2.5-1.2b-instruct"),
+            &GenerationConfig {
+                vision: Some(true),
+                ..GenerationConfig::default()
+            }
+        ));
     }
 
     #[tokio::test]
@@ -213,6 +231,7 @@ mod tests {
             model: Some("gpt-4.1-mini".to_owned()),
             quantization: None,
             vision: false,
+            reasoning: false,
         };
 
         assert!(!translator.release().await);

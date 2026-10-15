@@ -74,24 +74,26 @@ impl LocalTranslator {
         }
 
         let image = request.image.clone();
-        let prompt = self.render_prompt(&request)?;
+        let prompt = self.render_prompt(
+            &request,
+            generation.reasoning.unwrap_or(false) && self.descriptor.reasoning,
+        )?;
         let schema = prompt::output_schema(expected);
         let llm = Arc::clone(&self.llm);
         let generation = self.descriptor.generation.options(generation);
-        let output = tokio::task::spawn_blocking(move || {
+        let output = tokio_rayon::spawn(move || {
             let input = image.as_deref().map_or_else(
                 || Input::new(&prompt),
                 |image| Input::new(&prompt).with_image(image),
             );
             llm.inference_with_json_schema(&input, &generation, &schema)
         })
-        .await
-        .context("local translation task panicked")??;
+        .await?;
         let segments = prompt::translations("local", &output.text, &request.segments)?;
         Ok(segments)
     }
 
-    fn render_prompt(&self, request: &TranslationRequest) -> Result<String> {
+    fn render_prompt(&self, request: &TranslationRequest, reasoning: bool) -> Result<String> {
         let (system, payload) = prompt::prompts(request)?;
         let payload = if request.image.is_some() {
             format!("{}\n{payload}", media_marker())
@@ -104,6 +106,7 @@ impl LocalTranslator {
                 &[ChatMessage::system(system), ChatMessage::user(payload)],
                 ChatTemplateOptions {
                     add_generation_prompt: true,
+                    enable_thinking: reasoning,
                 },
             )
             .context("failed to render local translation prompt")?)
@@ -123,9 +126,13 @@ pub(crate) fn models() -> Vec<Model> {
                 .map(|quantization| Quantization {
                     id: quantization.id.to_owned(),
                     name: quantization.name.to_owned(),
+                    downloaded: std::iter::once(quantization.filename)
+                        .chain(descriptor.projector)
+                        .all(|filename| descriptor.file(filename).exists()),
                 })
                 .collect(),
             vision: descriptor.projector.is_some(),
+            reasoning: descriptor.reasoning,
         })
         .collect()
 }

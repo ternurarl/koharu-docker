@@ -245,6 +245,7 @@ mod tests {
         DecodedImage {
             width,
             height,
+            encoded: Arc::from([0_u8; 1]),
             pixels: rgba
                 .repeat((width * height) as usize)
                 .into_boxed_slice()
@@ -327,6 +328,7 @@ mod tests {
         let src = DecodedImage {
             width: 2,
             height: 2,
+            encoded: Arc::from([0_u8; 1]),
             pixels: Arc::from(vec![
                 255_u8, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 0, 255,
             ]),

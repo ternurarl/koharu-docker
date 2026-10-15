@@ -150,6 +150,63 @@ async fn remote_translation_leaves_the_accelerator_lane_alone() {
 }
 
 #[tokio::test]
+async fn stop_after_a_page_keeps_completed_progress() {
+    let translation = TranslationConfig {
+        model: koharu_translator::ModelSelection {
+            provider: koharu_translator::Provider::OpenAi,
+            model: Some("gpt-5.6-luna".to_owned()),
+            quantization: None,
+            vision: true,
+            reasoning: true,
+        },
+        ..Default::default()
+    };
+    let pipeline = pipeline(translation);
+    let mut session = koharu_scene::Session::memory().await.unwrap();
+    let patch = session
+        .snapshot()
+        .patch(|edit| {
+            edit.add_page(
+                koharu_scene::PageDraft::new("one", 1.0, 1.0),
+                koharu_scene::At::End,
+            )?;
+            edit.add_page(
+                koharu_scene::PageDraft::new("two", 1.0, 1.0),
+                koharu_scene::At::End,
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    session.commit(patch).await.unwrap();
+    let stop = StopToken::default();
+    let progress_stop = stop.clone();
+    let request = Request {
+        operation: Operation::Only {
+            stage: Stage::Translation,
+        },
+        stop,
+        progress: Some(std::sync::Arc::new(move |event| {
+            if matches!(event, Progress::Skipped { .. }) {
+                progress_stop.stop();
+            }
+        })),
+        ..Request::default()
+    };
+    let mut committer = RejectCommitter;
+    let report = pipeline
+        .execute(session.snapshot(), request, &mut committer)
+        .await
+        .release_resources()
+        .await
+        .result
+        .unwrap();
+
+    assert_eq!(report.status, RunStatus::Stopped);
+    assert_eq!(report.completed, 1);
+    assert_eq!(report.total, 2);
+}
+
+#[tokio::test]
 async fn a_finished_translation_releases_its_model_through_the_drain() {
     let pipeline = pipeline(remote_translation());
     let (snapshot, _page, _images) = image_fixture().await;
@@ -283,6 +340,7 @@ fn remote_translation() -> TranslationConfig {
             model: Some("gpt-4.1-mini".to_owned()),
             quantization: None,
             vision: false,
+            reasoning: false,
         },
         ..TranslationConfig::default()
     }
