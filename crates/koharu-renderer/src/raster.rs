@@ -12,7 +12,6 @@ use vello::wgpu::{
 };
 use vello::{
     AaConfig, AaSupport, RenderParams, RendererOptions, Scene, kurbo::Affine, peniko::Color,
-    util::RenderContext,
 };
 
 use crate::compose::Canvas;
@@ -87,8 +86,8 @@ pub struct Raster {
 }
 
 struct GpuState {
-    context: RenderContext,
-    device_id: usize,
+    device: wgpu::Device,
+    queue: wgpu::Queue,
     renderer: vello::Renderer,
     targets: Vec<RenderTarget>,
 }
@@ -117,11 +116,9 @@ impl Rasterizer {
     }
 
     fn try_new() -> Result<Self> {
-        let mut context = RenderContext::new();
-        let device_id = pollster::block_on(context.device(None))
-            .context("no WGPU adapter supports Vello's required features")?;
+        let (device, queue) = pollster::block_on(request_device())?;
         let renderer = vello::Renderer::new(
-            &context.devices[device_id].device,
+            &device,
             RendererOptions {
                 antialiasing_support: AaSupport::area_only(),
                 ..Default::default()
@@ -131,8 +128,8 @@ impl Rasterizer {
 
         Ok(Self {
             gpu: Mutex::new(GpuState {
-                context,
-                device_id,
+                device,
+                queue,
                 renderer,
                 targets: Vec::new(),
             }),
@@ -399,13 +396,12 @@ impl Rasterizer {
         let (device, submission, target) = {
             let mut gpu = self.gpu.lock();
             let GpuState {
-                context,
-                device_id,
+                device,
+                queue,
                 renderer,
                 targets,
             } = &mut *gpu;
-            let device = context.devices[*device_id].device.clone();
-            let queue = &context.devices[*device_id].queue;
+            let device = device.clone();
             let limits = device.limits();
             if width > limits.max_texture_dimension_2d || height > limits.max_texture_dimension_2d {
                 bail!(
@@ -467,7 +463,9 @@ impl Rasterizer {
             .context("WGPU closed the readback channel")?
             .context("failed to map WGPU readback buffer")?;
 
-        let mapped = slice.get_mapped_range();
+        let mapped = slice
+            .get_mapped_range()
+            .map_err(|error| anyhow!("failed to map WGPU readback buffer: {error:?}"))?;
         let row_len = (width * 4) as usize;
         let mut pixels = Vec::with_capacity(row_len * height as usize);
         for row in mapped
@@ -485,6 +483,39 @@ impl Rasterizer {
         }
         Ok(pixels)
     }
+}
+
+/// Creates the device as Vello's `RenderContext::device` does, but with the
+/// adapter's texture and buffer limits. Vello requests `Limits::default()`,
+/// which caps every surface at 8192 px and its readback at 256 MiB whatever
+/// the GPU supports.
+async fn request_device() -> Result<(wgpu::Device, wgpu::Queue)> {
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+        display: None,
+        backends: wgpu::Backends::from_env().unwrap_or_default(),
+        flags: wgpu::InstanceFlags::from_build_config().with_env(),
+        memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
+        backend_options: wgpu::BackendOptions::from_env_or_default(),
+    });
+    let adapter = wgpu::util::initialize_adapter_from_env_or_default(&instance, None)
+        .await
+        .context("no WGPU adapter is available")?;
+    let supported = adapter.limits();
+    let required_limits = wgpu::Limits {
+        max_texture_dimension_2d: supported.max_texture_dimension_2d,
+        max_buffer_size: supported.max_buffer_size,
+        ..wgpu::Limits::default()
+    };
+    let optional_features = wgpu::Features::CLEAR_TEXTURE | wgpu::Features::PIPELINE_CACHE;
+    adapter
+        .request_device(&wgpu::DeviceDescriptor {
+            label: Some("koharu rasterizer device"),
+            required_features: adapter.features() & optional_features,
+            required_limits,
+            ..Default::default()
+        })
+        .await
+        .context("no WGPU adapter supports Vello's required features")
 }
 
 impl RenderTarget {
@@ -531,4 +562,33 @@ impl RenderTarget {
 
 pub(crate) fn rgba([r, g, b, a]: [u8; 4]) -> Color {
     Color::from_rgba8(r, g, b, a)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// WGPU's default limits cap textures at 8192 px, far below what desktop
+    /// GPUs support, and tall scans or spreads exceed it.
+    ///
+    /// Ignored in environments whose WGPU adapter self-reports a
+    /// `max_texture_dimension_2d` below 9000 (e.g. software Vulkan with an
+    /// 8192 limit): the rasterizer correctly refuses such surfaces there, so
+    /// the test cannot pass without a higher-limit adapter.
+    #[test]
+    #[ignore = "requires a WGPU adapter with max_texture_dimension_2d >= 9000"]
+    fn rasterizes_surfaces_beyond_the_default_wgpu_texture_limit() {
+        let image = Rasterizer::new()
+            .unwrap()
+            .rasterize_scene(
+                &Scene::new(),
+                4,
+                9000,
+                [10, 20, 30, 255],
+                RasterOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(image.dimensions(), (4, 9000));
+        assert_eq!(image.get_pixel(3, 8999).0, [10, 20, 30, 255]);
+    }
 }

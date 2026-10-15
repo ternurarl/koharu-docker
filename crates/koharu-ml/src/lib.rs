@@ -3,25 +3,6 @@ use koharu_llama::llama_backend::LlamaBackend;
 use koharu_runtime::{Feature, Hardware, Runtime};
 use tokio::sync::OnceCell;
 
-macro_rules! model_repository {
-    ($repository:literal @ $revision:literal { $($name:ident = $filename:literal),+ $(,)? }) => {
-        $(
-            const $name: koharu_runtime::HuggingFaceFile<'static> =
-                koharu_runtime::HuggingFaceFile::pinned(
-                    $repository,
-                    $revision,
-                    $filename,
-                );
-        )+
-    };
-    ($repository:literal { $($name:ident = $filename:literal),+ $(,)? }) => {
-        $(
-            const $name: koharu_runtime::HuggingFaceFile<'static> =
-                koharu_runtime::HuggingFaceFile::latest($repository, $filename);
-        )+
-    };
-}
-
 mod backend;
 
 pub mod aot_inpainting;
@@ -32,6 +13,7 @@ pub mod comic_text_bubble_detector;
 pub mod comic_text_detector;
 pub mod flux2_klein;
 pub mod font_detector;
+pub mod hayai_ocr;
 pub mod koharu_layout_rfdetr_seg_2xl;
 pub mod lama;
 pub mod llm;
@@ -85,8 +67,7 @@ async fn init_features(features: Vec<Feature>) -> anyhow::Result<()> {
     READY
         .get_or_try_init(move || async move {
             let runtime = Runtime::discover(features.iter().copied())?;
-            let device = runtime.device().cloned().unwrap_or_else(Device::cpu);
-            runtime
+            let device = runtime
                 .initialize()
                 .await
                 .context("failed to initialize runtimes")?;
@@ -162,3 +143,18 @@ pub fn runtime_init() -> Option<RuntimeInit> {
         (false, false) => RuntimeInit::Cpu,
     })
 }
+
+macro_rules! model_repository {
+    ($repository:literal @ $revision:literal { $($name:ident = $filename:literal),+ $(,)? }) => {
+        $(
+            const $name: koharu_runtime::HuggingFaceFile<'static> =
+                koharu_runtime::HuggingFaceFile::pinned(
+                    $repository,
+                    $revision,
+                    $filename,
+                );
+        )+
+    };
+}
+
+pub(crate) use model_repository;

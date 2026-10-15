@@ -42,9 +42,7 @@ impl Llm {
         options: LoadOptions,
     ) -> Result<Self> {
         let model_path = model_path.into();
-        let model = tokio::task::spawn_blocking(move || Model::new(&device, model_path, options))
-            .await
-            .context("LLM loading task panicked")??;
+        let model = tokio_rayon::spawn(move || Model::new(&device, model_path, options)).await?;
         Ok(Self { model })
     }
 
@@ -69,14 +67,13 @@ impl Llm {
         self.render_chat_prompt_with_options(messages, ChatTemplateOptions::default())
     }
 
-    /// Applies the GGUF chat template with explicit generation-prompt behavior.
+    /// Applies the GGUF chat template with explicit generation and reasoning behavior.
     pub fn render_chat_prompt_with_options(
         &self,
         messages: &[ChatMessage],
         options: ChatTemplateOptions,
     ) -> Result<String> {
-        self.model
-            .render_chat_prompt(messages, options.add_generation_prompt)
+        self.model.render_chat_prompt(messages, options)
     }
 
     /// Generates unconstrained text for an input.
@@ -410,12 +407,15 @@ impl ChatRole {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChatTemplateOptions {
     pub add_generation_prompt: bool,
+    /// Exposes the standard `enable_thinking` variable to compatible templates.
+    pub enable_thinking: bool,
 }
 
 impl Default for ChatTemplateOptions {
     fn default() -> Self {
         Self {
             add_generation_prompt: true,
+            enable_thinking: false,
         }
     }
 }

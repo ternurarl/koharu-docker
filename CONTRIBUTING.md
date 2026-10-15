@@ -1,21 +1,24 @@
 # Contributing
 
-Thank you for your interest in contributing to Koharu!
+Thank you for helping improve Koharu. Bug fixes, documentation, translations, model-port corrections, and focused product improvements are all welcome.
 
-> [!IMPORTANT]
-> Please read the complete contributing guide on the [website](https://koharu.rs/development/contributing/).
+Everyone participating in the Koharu community is expected to follow our [Code of Conduct](CODE_OF_CONDUCT.md).
 
-Please check out our [good first issues](https://github.com/mayocream/koharu/contribute) or ask for guidance on [Discord](https://discord.gg/mHvHkxGnUY).
+## Getting started
 
-We welcome and appreciate any form of contributions.
+- Browse the [good first issues](https://github.com/koharu-rs/koharu/contribute) or search existing [issues](https://github.com/koharu-rs/koharu/issues) and pull requests.
+- Small bug fixes, documentation improvements, tests, and other focused changes can usually be submitted directly.
+- Before starting a new product feature, significant UI change, model or provider integration, platform integration, dependency, public API, schema change, or architectural refactor, open an issue and discuss the problem and direction with the maintainers.
+- Ask for guidance on [Discord](https://discord.gg/mHvHkxGnUY) if you are unsure where to begin.
 
-## AI Usage Policy
+Keep your change focused, review the complete diff, and run the relevant checks before opening a pull request. Explain what changed and include the verification results so reviewers can help efficiently.
 
-When using AI tools (including LLMs like ChatGPT, Claude, Copilot, etc.) to contribute to Koharu:
+An open issue, feature request, or working implementation is not a promise that a change will be accepted. Maintainers consider product fit, user value, UX, architecture, performance, security, platform support, dependencies, and long-term maintenance. A feature may be declined, postponed, reduced in scope, or better kept outside the core project.
 
-- **Please disclose AI usage** to reduce maintainer fatigue
-- **You are responsible** for all AI-generated issues or PRs you submit
-- **Low-quality or unreviewed AI content will be closed immediately**
-- **Contributors who submit repeated low-quality ("slop") PRs will be banned without prior warning.** Bans may be lifted if you commit to contributing to Koharu in accordance with this policy. You may request an unban via our [Discord](https://discord.gg/mHvHkxGnUY).
+## AI-assisted contributions
 
-We encourage the use of AI tools to assist with development, but all contributions must be thoroughly reviewed and tested by the contributor before submission. AI-generated code should be understood, validated, and adapted to meet Koharu's standards.
+AI tools may assist development or communication, but a human contributor must remain the author and owner of every submission. Do not submit autonomous or unreviewed issues, pull requests, review comments, or security reports.
+
+Personally review the complete diff, verify generated claims against the code, understand and be able to explain every change, and provide the same relevant tests and evidence expected from any other contribution.
+
+For more details, read the complete [contributing guide](https://koharu.rs/development/contributing).

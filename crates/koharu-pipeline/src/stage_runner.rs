@@ -67,6 +67,21 @@ impl StageRunner {
         if job.stop.stopped() {
             return Ok(StageOutcome::Stopped);
         }
+        // Skip before the accelerator gate: a page that needs no work must not
+        // take a device lane (or wait for one) at all.
+        let skip = self.stages.skip(job.stage, &job.input).map_err(|error| {
+            self.stage_error(
+                job.stage,
+                model,
+                AttemptFailure {
+                    kind: ErrorKind::Processing,
+                    error,
+                },
+            )
+        })?;
+        if skip {
+            return Ok(StageOutcome::Skipped);
+        }
         // A remote translation request waits on the network and does no device
         // work, so it must not hold the accelerator lane: `Semaphore::new(1)`
         // would keep every local stage idle for the whole request.

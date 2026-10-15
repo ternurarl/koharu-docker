@@ -211,6 +211,7 @@ async fn g4_text_over_images() {
                 &SceneTextLayout {
                     origin: Origin::User,
                     kind: TextLayoutKind::Paragraph,
+                    angle_degrees: None,
                 },
             )?;
             edit.set(text, &Geometry::rectangle(8.0, 8.0, 48.0, 40.0))?;

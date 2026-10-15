@@ -79,6 +79,7 @@ async fn add_page_fixture(session: &mut Session, label: &str) -> PageFixture {
                 &TextLayout {
                     origin: Origin::User,
                     kind: TextLayoutKind::Paragraph,
+                    angle_degrees: None,
                 },
             )?;
             edit.relate::<RecognizedFrom>(content, region)?;

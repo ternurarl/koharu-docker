@@ -78,3 +78,7 @@ __pycache__/
 # Local model weights and audit output
 hayai-ocr-v2.5-nova/
 koharu-memory-audit-*/
+
+# Local documentation output
+/packages/docs/.mintlify/
+/packages/docs/site/
