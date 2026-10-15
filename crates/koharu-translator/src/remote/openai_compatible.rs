@@ -42,19 +42,22 @@ pub(super) async fn compatible(
 ) -> Result<Vec<String>> {
     let api_key = koharu_secrets::get("openai-compatible")?;
     let endpoint = endpoint(config.base_url.as_ref(), "chat/completions");
-    translate(
-        client,
-        ChatBackend::new(
-            "openai-compatible",
-            &endpoint,
-            api_key.as_ref().map(ExposeSecret::expose_secret),
-            model,
-            generation,
-            ResponseMode::PromptOnly,
-        ),
-        request,
-    )
-    .await
+    let mut backend = ChatBackend::new(
+        "openai-compatible",
+        &endpoint,
+        api_key.as_ref().map(ExposeSecret::expose_secret),
+        model,
+        generation,
+        ResponseMode::PromptOnly,
+    );
+    // Compatible endpoints can enable reasoning when this field is omitted.
+    // The shared generation setting defaults to off, so send that choice explicitly.
+    backend.thinking = Some(if generation.thinking {
+        "enabled"
+    } else {
+        "disabled"
+    });
+    translate(client, backend, request).await
 }
 
 pub(super) async fn translate(
