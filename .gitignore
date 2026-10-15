@@ -56,3 +56,25 @@ test-results/
 
 # Zensical build output
 /docs/site/
+.claude/CLAUDE.md
+.claude/settings.json
+.codex/config.toml
+.cursor/mcp.json
+.dsh-tmp/pipeline.json
+.gemini/settings.json
+.dsh-tmp/pipeline.json
+.vscode/mcp.json
+GEMINI.md
+opencode.jsonc
+.dsh-tmp/pipeline.json
+
+# Local tool configuration
+.mcp.json
+
+# Local indexes and caches
+.codegraph/
+__pycache__/
+
+# Local model weights and audit output
+hayai-ocr-v2.5-nova/
+koharu-memory-audit-*/

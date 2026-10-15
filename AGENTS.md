@@ -128,3 +128,14 @@ Document only durable, repository-specific constraints here. Do not record curre
 ### 发送前自查
 
 交出任何一段话之前逐项检查：否定都满足第 2 条；第一句直接回答所问；术语满足第 11 条；宾语具体到名字；没有自造压缩词、比喻与对比修辞；句子与标题完整；交付报告满足第 21 至 24 条；结尾是结论；声称执行过的动作已经真实执行。
+
+<!-- CODEGRAPH_START -->
+## CodeGraph
+
+In repositories indexed by CodeGraph (a `.codegraph/` directory exists at the repo root), reach for it BEFORE grep/find or reading files when you need to understand or locate code:
+
+- **MCP tool** (when available): `codegraph_explore` answers most code questions in one call — the relevant symbols' verbatim source plus the call paths between them, including dynamic-dispatch hops grep can't follow. Name a file or symbol in the query to read its current line-numbered source. If it's listed but deferred, load it by name via tool search.
+- **Shell** (always works): `codegraph explore "<symbol names or question>"` prints the same output.
+
+If there is no `.codegraph/` directory, skip CodeGraph entirely — indexing is the user's decision.
+<!-- CODEGRAPH_END -->
