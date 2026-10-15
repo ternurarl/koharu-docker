@@ -24,6 +24,10 @@ impl AcceleratorGate {
         }
     }
 
+    /// Takes the accelerator lane for one stage.
+    ///
+    /// Only stages that do device work call this: a remote translation request
+    /// is a network wait and must not hold the lane while local stages idle.
     pub(crate) async fn acquire(&self) -> AcceleratorPermit {
         let Some(lane) = self.lane.as_ref() else {
             return AcceleratorPermit::cpu();

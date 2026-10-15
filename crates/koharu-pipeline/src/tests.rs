@@ -1,9 +1,14 @@
 use super::*;
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 use image::{ExtendedColorType, ImageEncoder as _};
 use koharu_scene::AssetRole;
+
+use crate::{execution::release_plan, stages::Stages};
 
 #[test]
 fn configuration_ignores_unknown_fields() {
@@ -81,6 +86,131 @@ async fn task_memory_release_lifecycle() {
 }
 
 #[test]
+fn release_plan_orders_translation_first_and_the_canonical_stages_after() {
+    let resident = resident(&Stage::ALL);
+    assert_eq!(
+        release_plan(&resident, &BTreeMap::new(), |_| true),
+        vec![
+            Stage::Translation,
+            Stage::Detection,
+            Stage::Ocr,
+            Stage::Inpainting,
+        ]
+    );
+}
+
+#[test]
+fn release_plan_stops_at_the_first_stage_whose_work_has_not_drained() {
+    let resident = resident(&[Stage::Detection, Stage::Ocr, Stage::Inpainting]);
+
+    // A job still in flight holds its model, and so does every stage behind it.
+    let running = BTreeMap::from([(Stage::Ocr, 1)]);
+    assert_eq!(
+        release_plan(&resident, &running, |_| true),
+        vec![Stage::Detection]
+    );
+
+    // Unfinished work blocks the same way: a stopped run leaves work items open.
+    assert_eq!(
+        release_plan(&resident, &BTreeMap::new(), |stage| stage != Stage::Ocr),
+        vec![Stage::Detection]
+    );
+}
+
+#[test]
+fn release_plan_skips_stages_that_are_not_resident() {
+    assert_eq!(
+        release_plan(&resident(&[Stage::Inpainting]), &BTreeMap::new(), |_| true),
+        vec![Stage::Inpainting]
+    );
+
+    // A drained translation releases on its own without waiting for the local
+    // stages that are still busy.
+    let resident = resident(&[Stage::Translation, Stage::Inpainting]);
+    let running = BTreeMap::from([(Stage::Inpainting, 1)]);
+    assert_eq!(
+        release_plan(&resident, &running, |_| true),
+        vec![Stage::Translation]
+    );
+}
+
+#[tokio::test]
+async fn remote_translation_leaves_the_accelerator_lane_alone() {
+    let local = stages(TranslationConfig::default());
+    assert!(local.needs_accelerator(Stage::Detection));
+    assert!(local.needs_accelerator(Stage::Ocr));
+    assert!(local.needs_accelerator(Stage::Translation));
+    assert!(local.needs_accelerator(Stage::Inpainting));
+
+    let remote = stages(remote_translation());
+    assert!(remote.needs_accelerator(Stage::Detection));
+    assert!(remote.needs_accelerator(Stage::Ocr));
+    assert!(!remote.needs_accelerator(Stage::Translation));
+    assert!(remote.needs_accelerator(Stage::Inpainting));
+}
+
+#[tokio::test]
+async fn a_finished_translation_releases_its_model_through_the_drain() {
+    let pipeline = pipeline(remote_translation());
+    let (snapshot, _page, _images) = image_fixture().await;
+
+    let release = execute_task(
+        &pipeline,
+        snapshot,
+        Request {
+            operation: Operation::Only {
+                stage: Stage::Translation,
+            },
+            ..Request::default()
+        },
+    )
+    .await;
+    assert_release_order(&release);
+    let report = release.result.unwrap();
+    assert_eq!(report.status, RunStatus::Completed);
+    assert_eq!(report.completed, 1);
+    // `release_task_models` never covers translation, so the drain is the only
+    // place its model is released. Nothing was loaded, hence `false` (a release
+    // that finds no model is not a failure).
+    assert_eq!(report.released_models, vec![(Stage::Translation, false)]);
+}
+
+#[tokio::test]
+async fn a_stopped_task_releases_the_models_it_still_holds() {
+    let pipeline = pipeline(remote_translation());
+    let (snapshot, _page, _images) = image_fixture().await;
+    let stop = StopToken::default();
+    let cancel = stop.clone();
+
+    let release = execute_task(
+        &pipeline,
+        snapshot,
+        Request {
+            operation: Operation::Only {
+                stage: Stage::Translation,
+            },
+            stop,
+            progress: Some(Arc::new(move |progress| {
+                // Cancel once a job is under way, so the run stops with work
+                // still open rather than before anything dispatched.
+                if let Progress::Loading { .. } = progress {
+                    cancel.stop();
+                }
+            })),
+            ..Request::default()
+        },
+    )
+    .await;
+    assert_release_order(&release);
+    let report = release.result.unwrap();
+    assert_eq!(report.status, RunStatus::Stopped);
+    assert_eq!(report.completed, 0);
+    // The work item is still open at that point, so only the end-of-run drain
+    // can release the model.
+    assert_eq!(report.released_models, vec![(Stage::Translation, false)]);
+}
+
+#[test]
 fn operations_expand_to_the_supported_workflows() {
     assert_eq!(
         Operation::Through {
@@ -138,6 +268,40 @@ fn assert_release_order(release: &TaskRelease) {
         vec![Stage::Detection, Stage::Ocr, Stage::Inpainting]
     );
     assert_eq!(release.image_cache_items, 0);
+}
+
+fn resident(stages: &[Stage]) -> BTreeSet<Stage> {
+    stages.iter().copied().collect()
+}
+
+/// A translation model that never touches the device: the remote providers only
+/// talk to the network.
+fn remote_translation() -> TranslationConfig {
+    TranslationConfig {
+        model: koharu_translator::ModelSelection {
+            provider: koharu_translator::Provider::OpenAi,
+            model: Some("gpt-4.1-mini".to_owned()),
+            quantization: None,
+            vision: false,
+        },
+        ..TranslationConfig::default()
+    }
+}
+
+fn stages(translation: TranslationConfig) -> Stages {
+    Stages::new(
+        &PipelineConfig {
+            translation,
+            ..PipelineConfig::default()
+        },
+        koharu_translator::Translator::from_config(
+            koharu_ml::Device::cpu(),
+            koharu_config::Config::memory(koharu_translator::ProvidersConfig::default()),
+        )
+        .unwrap(),
+        &koharu_ml::Device::cpu(),
+    )
+    .unwrap()
 }
 
 #[derive(Default)]

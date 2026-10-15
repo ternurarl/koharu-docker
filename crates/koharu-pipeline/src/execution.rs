@@ -29,20 +29,62 @@ pub(crate) struct Execution<'a> {
     scope: NormalizedScope,
     scheduler: Scheduler,
     scene: Snapshot,
+    /// Decoded source images, one cache per live page.
+    ///
+    /// A page's cache is dropped once that page has finished every stage, and
+    /// every cache is cleared when the run ends. Stage batches no longer clear
+    /// them: under concurrency another stage may still be decoding from a cache
+    /// this one has finished with, so a page's decoded source image stays alive
+    /// from Detection through Inpainting. The stage-overlap plan's memory
+    /// estimate does not include those images; it is a trade-off to measure.
     images: BTreeMap<EntityId, Arc<ImageCache>>,
-    busy_stages: BTreeSet<Stage>,
+    /// Jobs dispatched per stage and not yet completed, including jobs that
+    /// ended in failure or with `Stopped`.
+    running: BTreeMap<Stage, usize>,
+    /// Stages whose models are loaded and not released yet.
+    resident: BTreeSet<Stage>,
     completed: usize,
     failure: Option<PipelineError>,
     base: koharu_scene::Revision,
     started: Instant,
     inpainting_mask: Option<crate::InpaintingMask>,
-    active_batch: Option<Stage>,
     released: Vec<(Stage, bool)>,
 }
 
 pub(crate) struct RunOutcome {
     pub(crate) result: std::result::Result<Report, PipelineError>,
     pub(crate) images: Vec<Arc<ImageCache>>,
+}
+
+/// The resident stage models that may be released right now, in release order.
+///
+/// Translation is released first and on its own: it is not part of the
+/// canonical `Detection` -> `Ocr` -> `Inpainting` order and `release_task_models`
+/// never covers it, so a resident translator is freed only here. The canonical
+/// stages are released in that order and the walk stops at the first resident
+/// stage whose work has not drained, which is what keeps `released_models`
+/// ordered `Detection` -> `Ocr` -> `Inpainting`.
+pub(crate) fn release_plan(
+    resident: &BTreeSet<Stage>,
+    running: &BTreeMap<Stage, usize>,
+    stage_finished: impl Fn(Stage) -> bool,
+) -> Vec<Stage> {
+    let drained =
+        |stage: Stage| running.get(&stage).copied().unwrap_or(0) == 0 && stage_finished(stage);
+    let mut plan = Vec::with_capacity(3);
+    if resident.contains(&Stage::Translation) && drained(Stage::Translation) {
+        plan.push(Stage::Translation);
+    }
+    for stage in [Stage::Detection, Stage::Ocr, Stage::Inpainting] {
+        if !resident.contains(&stage) {
+            continue;
+        }
+        if !drained(stage) {
+            break;
+        }
+        plan.push(stage);
+    }
+    plan
 }
 
 impl<'a> Execution<'a> {
@@ -89,20 +131,21 @@ impl<'a> Execution<'a> {
             scheduler: Scheduler::new(&pages, &stages),
             scene: snapshot,
             images: BTreeMap::new(),
-            busy_stages: BTreeSet::new(),
+            running: BTreeMap::new(),
+            resident: BTreeSet::new(),
             completed: 0,
             failure: None,
             base,
             started,
             inpainting_mask: request.inpainting_mask,
-            active_batch: None,
             released: Vec::new(),
         })
     }
 
     pub(crate) async fn run(mut self) -> RunOutcome {
         if self.stopped() {
-            self.release_active_batch().await;
+            self.release_everything().await;
+            self.clear_images();
             let result = Ok(self.report(RunStatus::Stopped));
             return self.finish(result);
         }
@@ -121,27 +164,21 @@ impl<'a> Execution<'a> {
                 break;
             };
             let completed_stage = completion.stage;
-            self.busy_stages.remove(&completion.stage);
-            let batch_drained = self.active_batch.is_some_and(|stage| {
-                stage == completed_stage && !self.busy_stages.contains(&stage)
-            });
-            if self.stopped() || self.failure.is_some() {
-                continue;
-            }
-            if let Err(error) = self.apply_completion(completion).await {
+            self.job_finished(completed_stage);
+            // A stopped or failed run keeps its remaining jobs running to the
+            // end but discards their output, so nothing is committed past that
+            // point. The drain still runs: a job that did finish may have been
+            // the last one holding a model.
+            if !self.stopped() && self.failure.is_none()
+                && let Err(error) = self.apply_completion(completion).await
+            {
                 self.failure = Some(error);
             }
-            if batch_drained && self.scheduler.stage_finished(completed_stage) {
-                self.release_active_batch().await;
-            }
+            self.release_drained().await;
         }
 
-        if let Some(stage) = self.active_batch
-            && (self.stopped() || self.failure.is_some())
-        {
-            self.finish_batch(stage);
-        }
-        self.release_active_batch().await;
+        self.release_everything().await;
+        self.clear_images();
         let result = self.finalize();
         self.finish(result)
     }
@@ -157,9 +194,8 @@ impl<'a> Execution<'a> {
         if self.stopped() || self.failure.is_some() {
             return None;
         }
-        let (page, stage) = self.scheduler.start_next(&self.busy_stages)?;
-        self.busy_stages.insert(stage);
-        self.active_batch = Some(stage);
+        let (page, stage) = self.scheduler.start_next(&self.running)?;
+        self.job_started(stage);
         let images = self
             .images
             .entry(page)
@@ -183,6 +219,17 @@ impl<'a> Execution<'a> {
         ))
     }
 
+    fn job_started(&mut self, stage: Stage) {
+        *self.running.entry(stage).or_default() += 1;
+        self.resident.insert(stage);
+    }
+
+    fn job_finished(&mut self, stage: Stage) {
+        if let Some(count) = self.running.get_mut(&stage) {
+            *count = count.saturating_sub(1);
+        }
+    }
+
     async fn apply_completion(
         &mut self,
         completion: StageCompletion,
@@ -201,6 +248,12 @@ impl<'a> Execution<'a> {
                 progress::emit(self.progress.as_ref(), Progress::Skipped { page, stage });
             }
             StageOutcome::Patch(patch) => {
+                // Commit before marking the stage complete. `mark_page_stage`
+                // is what satisfies downstream prerequisites, so a stage that
+                // is marked first lets the next one build its patch against a
+                // scene that does not contain this output yet. Nothing in the
+                // patch layer catches that: an out-of-date translation patch
+                // commits cleanly and leaves a stale translation behind.
                 if !self.commit_patch(page, stage, patch).await? {
                     return Ok(());
                 }
@@ -225,6 +278,11 @@ impl<'a> Execution<'a> {
         stage: Stage,
         patch: koharu_scene::Patch,
     ) -> std::result::Result<bool, PipelineError> {
+        // Jobs now finish out of order, so a patch is usually rebased onto a
+        // scene that has moved since it was built. `rebase_on` plus
+        // `validate_on` reject a patch whose observations no longer hold, and
+        // `validate_commit` rejects a committer that did not advance the
+        // revision: both stay as the safety net for out-of-order commits.
         let patch = patch
             .rebase_on(&self.scene)
             .and_then(|patch| {
@@ -249,34 +307,41 @@ impl<'a> Execution<'a> {
         Ok(true)
     }
 
-    async fn release_active_batch(&mut self) {
-        let Some(stage) = self.active_batch.take() else {
-            return;
-        };
-        debug_assert!(
-            !self.busy_stages.contains(&stage),
-            "a stage batch cannot be released while one of its jobs is running"
-        );
-        let released = self.runner.release_stage(stage).await;
-        self.released.push((stage, released));
+    /// Releases the resident models whose work has drained, in release order.
+    async fn release_drained(&mut self) {
+        let plan = release_plan(&self.resident, &self.running, |stage| {
+            self.scheduler.stage_finished(stage)
+        });
+        for stage in plan {
+            debug_assert_eq!(
+                self.running.get(&stage).copied().unwrap_or(0),
+                0,
+                "a stage model cannot be released while one of its jobs is running"
+            );
+            self.resident.remove(&stage);
+            let released = self.runner.release_stage(stage).await;
+            self.released.push((stage, released));
+        }
     }
 
-    fn finish_batch(&mut self, stage: Stage) {
-        self.scheduler.finish_stage(stage);
-        self.clear_images();
+    /// Closes whatever work is still open and releases every resident model.
+    ///
+    /// Nothing runs past this point, so a stage whose work never finished — a
+    /// stopped or failed run leaves its open work items `Running` — is closed
+    /// first, which is what lets the drain release its model as well.
+    async fn release_everything(&mut self) {
+        for stage in Stage::ALL {
+            self.scheduler.finish_stage(stage);
+        }
+        self.release_drained().await;
     }
 
     fn mark_page_stage(&mut self, page: EntityId, stage: Stage) {
         if self.scheduler.complete_stage(page, stage) {
+            // The page is done: no stage will read its source image again.
             self.images.remove(&page);
         }
         self.completed += 1;
-        if self
-            .active_batch
-            .is_some_and(|active| active == stage && self.scheduler.stage_finished(stage))
-        {
-            self.clear_images();
-        }
     }
 
     fn clear_images(&mut self) {

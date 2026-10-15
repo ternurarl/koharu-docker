@@ -72,6 +72,8 @@ pub(crate) struct Stages {
     ocr: ocr::Processor,
     translation: translation::Processor,
     inpainting: inpainting::Processor,
+    /// Whether the configured translation model runs on the local device.
+    translation_local: bool,
 }
 
 impl Stages {
@@ -85,7 +87,23 @@ impl Stages {
             ocr: ocr::Processor::new(config.ocr.clone(), device.clone()),
             translation: translation::Processor::new(config.translation.clone(), translator),
             inpainting: inpainting::Processor::new(config.inpainting()?, device.clone())?,
+            translation_local: config.translation.model.provider
+                == koharu_translator::Provider::Local,
         })
+    }
+
+    /// Whether `stage` does work on the accelerator device.
+    ///
+    /// A remote translation request is pure network wait: `Translator::translate`
+    /// routes a non-local provider to `remote::translate` and loads no device
+    /// model. Taking the accelerator lane for it would hold `Semaphore::new(1)`
+    /// for the whole request and idle every local stage behind it, so only a
+    /// local translator joins the lane.
+    pub(crate) fn needs_accelerator(&self, stage: Stage) -> bool {
+        match stage {
+            Stage::Detection | Stage::Ocr | Stage::Inpainting => true,
+            Stage::Translation => self.translation_local,
+        }
     }
 
     fn processor(&self, stage: Stage) -> &dyn StageProcessor {
