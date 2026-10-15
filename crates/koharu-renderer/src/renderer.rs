@@ -583,6 +583,11 @@ impl Renderer {
                 &mut dependencies,
             )?);
         } else {
+            tracing::warn!(
+                entity = %page,
+                role = source_role.as_str(),
+                "missing page source asset; background layer will be skipped",
+            );
             traversal.diagnostics.push(RenderDiagnostic::MissingAsset {
                 entity: page,
                 role: source_role.as_str().to_owned(),
@@ -690,6 +695,11 @@ impl Traversal<'_> {
                         &mut common,
                     )?);
                 } else {
+                    tracing::warn!(
+                        entity = %entity,
+                        role = self.source_role.as_str(),
+                        "missing raster source asset; layer will be skipped",
+                    );
                     self.diagnostics.push(RenderDiagnostic::MissingAsset {
                         entity,
                         role: self.source_role.as_str().to_owned(),
