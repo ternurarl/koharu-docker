@@ -87,3 +87,15 @@ cherry-pick 级别的少量提交：
 translator → runtime → limits 修复 → ml/pipeline → PDF 移植 → renderer 排版。
 
 translator 先行（最干净）；runtime 体量大，单独一轮；limits 修复与 workaround 结论绑定，不要在移植时顺手删 CPU 路径；pipeline/renderer 与 fork 私有改动同文件，逐提交审。
+
+## 执行裁决（2026-10-15）
+
+审计返回后定案的取舍，应用阶段照此执行：
+
+- `7834852e` 取：下载层与 Hugging Face 客户端对齐上游 `hf-hub` 形态，依赖钉 commit `e88c9efe6d38bb370008ba0f5281249210c52176`（`85557a25` 不用 `branch = "main"`）。fork 手写客户端按行为对照替换，重试、修订解析、进度语义的差异逐条记录。
+- `4d9f3aca`、`8199a8b2` 暂缓：`8818911f` 只取 `crates/koharu-ml/src/backend.rs` 与 `crates/koharu-torch/src/nn/batch_norm.rs`，丢弃其 `rocm.rs` 删除 hunk。
+- `e47620c0` 的 lm_studio 切片归 translator 轮，`crates/koharu-llama` 侧归 runtime 轮，不重复应用。
+- `6d533281` 取 headless 子集（`crates/koharu-renderer/src/bubble.rs`、`crates/koharu-renderer/src/renderer.rs`、`crates/koharu-scene/src/components/layers.rs`）解锁 `b5f3c41c`。
+- `653eb14b` 不跟随目录重命名，保持 `crates/koharu-ml/src/paddle_ocr_vl_quantized.rs` 单文件。
+- PDF 导入扩展现有 `POST /projects/current/pages` 的 multipart 类型，路径与响应不变。
+- Atlas Cloud 跟随上游移除：应用 `9e8698be` 的 translator 切片（删 `src/remote/atlas_cloud.rs` 与 `provider.rs`、`src/remote/mod.rs`、`src/bin/translate.rs` 的注册），`e6d330c8`、`08601a8f`、`5b6672cc` 对 `atlas_cloud.rs` 的改动随之作废。
