@@ -173,11 +173,10 @@ docker run -p 4000:4000 \
   --device /dev/dri \
   -v koharu-data:/home/koharu/.local/share/Koharu \
   -v koharu-config:/home/koharu/.koharu \
-  -v koharu-cache:/home/koharu/.cache/koharu \
   koharu-headless
 ```
 
-默认 `CMD` 即 `--gpu`；无 GPU 的主机追加 `--host 0.0.0.0 --port 4000 --cpu`。注意：配置存于 `~/.koharu/config.toml`（不在 data 卷内），务必挂载 `koharu-config` 卷，否则重建容器会丢失全部配置。原生包（LibTorch、llama.cpp、stable-diffusion.cpp）在首次启动时下载到 `koharu-cache` 卷，不挂载则重建容器会重新下载几百兆。
+默认 `CMD` 即 `--gpu`；无 GPU 的主机追加 `--host 0.0.0.0 --port 4000 --cpu`。注意：配置存于 `~/.koharu/config.toml`（不在 data 卷内），务必挂载 `koharu-config` 卷，否则重建容器会丢失全部配置。原生包（LibTorch、llama.cpp、stable-diffusion.cpp）在首次启动时下载到 `koharu-data` 卷的 `packages/` 子目录（`crates/koharu-rpc/src/server.rs` 把 `Store::configure` 指到 `<data_dir>/packages`），随 data 卷持久化，不额外占卷。
 
 ## 故障排查
 
