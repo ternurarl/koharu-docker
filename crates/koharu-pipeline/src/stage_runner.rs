@@ -67,7 +67,15 @@ impl StageRunner {
         if job.stop.stopped() {
             return Ok(StageOutcome::Stopped);
         }
-        let permit = self.accelerator.acquire().await;
+        // A remote translation request waits on the network and does no device
+        // work, so it must not hold the accelerator lane: `Semaphore::new(1)`
+        // would keep every local stage idle for the whole request.
+        let accelerated = self.stages.needs_accelerator(job.stage);
+        let permit = if accelerated {
+            Some(self.accelerator.acquire().await)
+        } else {
+            None
+        };
         if job.stop.stopped() {
             return Ok(StageOutcome::Stopped);
         }
@@ -80,7 +88,14 @@ impl StageRunner {
 
         drop(permit);
         tracing::warn!(stage = %job.stage, page = %job.input.page(), error = %failure.error, "retrying stage after memory pressure");
-        let _permit = self.accelerator.recover(job.stage, &self.stages).await;
+        // `recover` takes the accelerator lane again by design and evicts the
+        // other models first. A stage that never held the lane has nothing to
+        // recover on the device, so its retry is just another attempt.
+        let _permit = if accelerated {
+            Some(self.accelerator.recover(job.stage, &self.stages).await)
+        } else {
+            None
+        };
         if job.stop.stopped() {
             return Ok(StageOutcome::Stopped);
         }

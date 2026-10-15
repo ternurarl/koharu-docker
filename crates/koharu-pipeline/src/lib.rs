@@ -44,4 +44,6 @@ use images::ImageCache;
 use model_cell::ModelCell;
 
 #[cfg(test)]
+mod overlap_tests;
+#[cfg(test)]
 mod tests;
