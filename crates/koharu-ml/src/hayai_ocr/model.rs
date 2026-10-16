@@ -1,7 +1,7 @@
 //! Inference-only Hayai OCR network.
 //!
 //! Hayai architecture and generation implementation:
-//! https://huggingface.co/JustANormalTinkerer/hayai-ocr-v2/blob/4a4ce477c9a8841f208b94e1d9ed5c0938965e05/modeling_hayai.py
+//! https://huggingface.co/JustANormalTinkerer/hayai-ocr-v2.5-nova/blob/2803d0dc005fa4396ab1e7c5a472d2c450a247f7/modeling_hayai.py
 //! SigLIP2 NaFlex vision encoder instantiated by the upstream `HayaiModel`:
 //! https://github.com/huggingface/transformers/blob/main/src/transformers/models/siglip2/modeling_siglip2.py
 
@@ -14,7 +14,7 @@ use koharu_torch::{
 };
 
 use super::{
-    config::{HayaiConfig, decoder, siglip2},
+    config::{HayaiConfig, SPATIAL_DOWNSCALE, decoder, decoder_vision_grid, siglip2},
     processor::{ImageInput, Tokenizer},
 };
 
@@ -88,6 +88,12 @@ impl Model {
         );
         let pixel_values = input.pixel_values.to_kind(kind);
         let [patch_height, patch_width] = input.spatial_shape;
+        ensure!(
+            patch_height > 0
+                && patch_width > 0
+                && patch_height * patch_width <= siglip2::MAX_NUM_PATCHES as i64,
+            "Hayai OCR received an invalid patch grid {patch_height}x{patch_width}"
+        );
 
         // The encoder masks padded patches as attention keys only; their query
         // rows still produce outputs that remain part of the visual prefix.
@@ -95,7 +101,10 @@ impl Model {
         let visual_features =
             self.vision_encoder
                 .forward(&pixel_values, patch_height, patch_width, Some(&key_mask));
-        let vision_embeddings = self.decoder.projector.forward(&visual_features);
+        let (vision_embeddings, patch_height_out, patch_width_out) = self
+            .decoder
+            .projector
+            .forward(&visual_features, patch_height, patch_width);
 
         let bos = Tensor::from_slice(&[self.bos_token_id])
             .view([1, 1])
@@ -129,31 +138,14 @@ impl Model {
         .unsqueeze(0)
         .unsqueeze(0);
 
-        let (visual_cos, visual_sin) = self.visual_rope(patch_height, patch_width);
-        // Rows of the visual prefix beyond this image's patch grid are padded
-        // patches; upstream leaves their angles at cos=1 / sin=0 (no rotation).
-        let covered_patches = patch_height * patch_width;
-        let padding_rows = m_vision - covered_patches;
-        let build_angles = |angles: &Tensor, padding: Tensor, first_text: &Tensor| {
-            Tensor::cat(
-                &[
-                    angles.unsqueeze(0),
-                    padding.unsqueeze(0),
-                    first_text.narrow(0, 0, 1).unsqueeze(0),
-                ],
-                1,
-            )
-        };
-        let identity_padding = |rows: i64, device| {
-            (
-                Tensor::ones([rows, decoder::HEAD_DIM / 2], (Kind::Float, device)),
-                Tensor::zeros([rows, decoder::HEAD_DIM / 2], (Kind::Float, device)),
-            )
-        };
-        let (padding_cos, padding_sin) =
-            identity_padding(padding_rows, self.text_rope_cos.device());
-        let cos = build_angles(&visual_cos, padding_cos, &self.text_rope_cos);
-        let sin = build_angles(&visual_sin, padding_sin, &self.text_rope_sin);
+        // RoPE runs on the *compressed* grid: the DSC projector merged every
+        // 2x2 patch block into one token, so the visual prefix has exactly
+        // `patch_height_out * patch_width_out` positions and no padding rows.
+        let (visual_cos, visual_sin) = self.visual_rope(patch_height_out, patch_width_out);
+        // Text position 0 is the BOS token that closes the prefix.
+        let first_text = |angles: &Tensor| angles.narrow(0, 0, 1).unsqueeze(0);
+        let cos = Tensor::cat(&[visual_cos.unsqueeze(0), first_text(&self.text_rope_cos)], 1);
+        let sin = Tensor::cat(&[visual_sin.unsqueeze(0), first_text(&self.text_rope_sin)], 1);
 
         let mut caches: Vec<LayerCache> = Vec::with_capacity(self.decoder.layers.len());
         for index in 0..self.decoder.layers.len() {
@@ -203,7 +195,7 @@ impl Model {
         Ok(tokens)
     }
 
-    /// Interleaved 2D rotary angles over this image's patch grid
+    /// Interleaved 2D rotary angles over this image's *compressed* patch grid
     /// (upstream `_get_2d_visual_freqs`), returning `(cos, sin)` of shape
     /// `(height * width, head_dim / 2)`.
     fn visual_rope(&self, height: i64, width: i64) -> (Tensor, Tensor) {
@@ -345,8 +337,14 @@ impl VisionEmbeddings {
         let patch_embeds = self.patch_embedding.forward(pixel_values);
         // Bilinear interpolation of the square base grid to this image's patch
         // shape (upstream `resize_positional_embeddings`). Upstream enables
-        // antialiasing, which the LibTorch binding does not expose; with a
-        // 16x16 source grid the difference is negligible.
+        // antialiasing (`_upsample_bilinear2d_aa`), which matters on the axes
+        // NaFlex shrinks: a crop whose patch grid is below the 16x16 base is
+        // downsampled there, and plain bilinear aliases that axis.
+        //
+        // `internal_upsample_bilinear2d_aa` is an internal ATen operator, not
+        // stable API: a LibTorch upgrade may rename or remove it. If that
+        // happens, re-check that the anti-aliased path is still what the
+        // upstream reference uses before swapping in another resize.
         let size = siglip2::POSITION_EMBEDDING_SIZE;
         let position_embeddings = self
             .position_embedding
@@ -355,7 +353,7 @@ impl VisionEmbeddings {
             .permute([2, 0, 1])
             .unsqueeze(0)
             .to_kind(Kind::Float)
-            .upsample_bilinear2d([height, width], false, None::<f64>, None::<f64>)
+            .internal_upsample_bilinear2d_aa([height, width], false, None::<f64>, None::<f64>)
             .to_kind(self.position_embedding.ws.kind())
             .reshape([siglip2::HIDDEN_SIZE, height * width])
             .transpose(0, 1);
@@ -573,21 +571,77 @@ impl Decoder {
 
 #[derive(Debug)]
 struct Projector {
-    linear1: nn::Linear,
-    linear2: nn::Linear,
+    norm: nn::LayerNorm,
+    mlp1: nn::Linear,
+    mlp2: nn::Linear,
+    out_norm: RmsNorm,
+    d_vision: i64,
 }
 
 impl Projector {
     fn new(path: &nn::Path<'_>, d_vision: i64, d_model: i64) -> Self {
+        let unshuffled_dim = d_vision * SPATIAL_DOWNSCALE * SPATIAL_DOWNSCALE;
+        // The MLP has no biases in the released checkpoint (`mlp.0.weight` and
+        // `mlp.2.weight` only), unlike the v2 projector which used `proj.*`.
+        let no_bias = nn::LinearConfig {
+            bias: false,
+            ..Default::default()
+        };
         Self {
-            linear1: nn::linear(path / "proj" / 0, d_vision, d_model, Default::default()),
-            linear2: nn::linear(path / "proj" / 2, d_model, d_model, Default::default()),
+            norm: nn::layer_norm(path / "norm", vec![unshuffled_dim], Default::default()),
+            mlp1: nn::linear(path / "mlp" / 0, unshuffled_dim, d_model, no_bias),
+            mlp2: nn::linear(path / "mlp" / 2, d_model, d_model, no_bias),
+            out_norm: RmsNorm::new(&(path / "out_norm"), d_model),
+            d_vision,
         }
     }
 
-    fn forward(&self, hidden_states: &Tensor) -> Tensor {
-        self.linear2
-            .forward(&self.linear1.forward(hidden_states).gelu("none"))
+    /// Nova `DSCProjector`: merges every `SPATIAL_DOWNSCALE^2` neighbouring
+    /// patches into a single decoder token, cutting the visual prefix 4x.
+    ///
+    /// Returns `(tokens, height_out, width_out)` where `tokens` has shape
+    /// `(1, height_out * width_out, d_model)`.
+    fn forward(
+        &self,
+        visual_features: &Tensor,
+        patch_height: i64,
+        patch_width: i64,
+    ) -> (Tensor, i64, i64) {
+        let scale = SPATIAL_DOWNSCALE;
+        let c = self.d_vision;
+        let (height_out, width_out) = decoder_vision_grid(patch_height, patch_width);
+
+        // (1, patches, C) -> (1, C, H, W) over this image's valid patches only.
+        let mut grid = visual_features
+            .narrow(1, 0, patch_height * patch_width)
+            .reshape([1, patch_height, patch_width, c])
+            .permute([0, 3, 1, 2]);
+        // Odd grids replicate the trailing row/column so every output cell sees
+        // a full block, matching the clamped gather indices upstream uses.
+        if patch_height < height_out * scale {
+            let last_row = grid.narrow(2, patch_height - 1, 1);
+            grid = Tensor::cat(&[&grid, &last_row], 2);
+        }
+        if patch_width < width_out * scale {
+            let last_col = grid.narrow(3, patch_width - 1, 1);
+            grid = Tensor::cat(&[&grid, &last_col], 3);
+        }
+
+        // `pixel_unshuffle` folds the block into channel `c * 4 + dy * 2 + dx`,
+        // the same layout as upstream's `gather_patches` transpose, so the
+        // LayerNorm and MLP columns line up without permuting the checkpoint.
+        // -> (1, C * 4, height_out, width_out) -> (1, height_out * width_out, C * 4)
+        let unshuffled = grid
+            .contiguous()
+            .pixel_unshuffle(scale)
+            .permute([0, 2, 3, 1])
+            .reshape([1, height_out * width_out, c * scale * scale]);
+        let hidden = self.mlp1.forward(&self.norm.forward(&unshuffled)).gelu("none");
+        (
+            self.out_norm.forward(&self.mlp2.forward(&hidden)),
+            height_out,
+            width_out,
+        )
     }
 }
 
@@ -808,5 +862,67 @@ impl RmsNorm {
                 .pow_tensor_scalar(2.0)
                 .mean_dim(&[-1i64][..], true, Some(Kind::Float));
         (&self.weight * hidden_states * (variance + RMS_NORM_EPS).rsqrt()).to_kind(input_kind)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pins the `pixel_unshuffle` channel interleaving the projector's
+    /// checkpoint layout depends on: after the unshuffle, channel
+    /// `c * 4 + dy * 2 + dx` of decoder cell `(oh, ow)` must carry the patch
+    /// feature at `(c, oh * 2 + dy, ow * 2 + dx)`, matching upstream
+    /// `gather_patches`' `g.transpose(2, 3).reshape(b, L, -1)`. A wrong
+    /// interleave would silently misapply the LayerNorm and MLP columns while
+    /// still producing plausible output.
+    #[tokio::test]
+    #[ignore = "requires the dynamically loaded LibTorch runtime"]
+    async fn pixel_unshuffle_channel_order_matches_upstream_gather_patches() -> Result<()> {
+        crate::init().await?;
+        let scale = SPATIAL_DOWNSCALE;
+        let (patch_height, patch_width) = (4, 4);
+        let (height_out, width_out) = decoder_vision_grid(patch_height, patch_width);
+        let channels = 3;
+
+        // Values encode their own (c, y, x) origin.
+        let mut values = vec![0.0f32; (patch_height * patch_width * channels) as usize];
+        for y in 0..patch_height {
+            for x in 0..patch_width {
+                for c in 0..channels {
+                    let patch = y * patch_width + x;
+                    values[(patch * channels + c) as usize] = (c * 100 + y * 10 + x) as f32;
+                }
+            }
+        }
+
+        // The projector's reshape/permute/unshuffle sequence on an even grid.
+        let unshuffled = Tensor::from_slice(&values)
+            .view([1, patch_height * patch_width, channels])
+            .reshape([1, patch_height, patch_width, channels])
+            .permute([0, 3, 1, 2])
+            .contiguous()
+            .pixel_unshuffle(scale)
+            .permute([0, 2, 3, 1])
+            .reshape([1, height_out * width_out, channels * scale * scale]);
+
+        for out_y in 0..height_out {
+            for out_x in 0..width_out {
+                let token = unshuffled.get(0).get(out_y * width_out + out_x);
+                for c in 0..channels {
+                    for dy in 0..scale {
+                        for dx in 0..scale {
+                            let channel = c * scale * scale + dy * scale + dx;
+                            assert_eq!(
+                                f32::try_from(token.get(channel)).unwrap(),
+                                (c * 100 + (out_y * scale + dy) * 10 + out_x * scale + dx) as f32,
+                                "channel {channel} of cell ({out_y}, {out_x}) must hold                                  (c={c}, dy={dy}, dx={dx})"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 }

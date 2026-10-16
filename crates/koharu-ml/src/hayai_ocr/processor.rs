@@ -14,6 +14,8 @@ use image::{DynamicImage, RgbImage};
 use koharu_torch::{Device, Kind, Tensor};
 use tokenizers::Tokenizer as HuggingFaceTokenizer;
 
+use icu_normalizer::ComposingNormalizerBorrowed;
+
 use super::config::siglip2;
 
 const RESCALE_FACTOR: f64 = 1.0 / 255.0;
@@ -236,13 +238,108 @@ impl Tokenizer {
     }
 }
 
+/// Cleans up raw generations the way the upstream release prescribes
+/// (README "Text Normalization Pipeline"), so output is comparable to the
+/// published benchmarks and usable as translation input.
+///
+/// The CJK-whitespace pass removes every space between two CJK characters in
+/// one scan. The reference does a single Python `re.sub` pass, which is
+/// non-overlapping and therefore leaves alternating gaps in a run of CJK words
+/// (`"漢 字 漢"` -> `"漢字 漢"`). That is an artifact of the scan, not intent,
+/// and downstream translation wants the spaces gone.
+pub(crate) fn normalize_text(text: &str) -> String {
+    if text.is_empty() {
+        return String::new();
+    }
+    let normalized = ComposingNormalizerBorrowed::new_nfkc().normalize(text);
+    // Fold CR/LF/TAB and every other whitespace run into a single space.
+    let mut folded = String::with_capacity(normalized.len());
+    let mut previous_space = false;
+    for character in normalized.chars() {
+        if character.is_whitespace() {
+            if !previous_space {
+                folded.push(' ');
+            }
+            previous_space = true;
+        } else {
+            folded.push(character);
+            previous_space = false;
+        }
+    }
+
+    // Drop the spaces that sit between two CJK characters.
+    let mut stripped = String::with_capacity(folded.len());
+    let mut chars = folded.chars().peekable();
+    while let Some(character) = chars.next() {
+        let between_cjk = character == ' '
+            && stripped.chars().next_back().is_some_and(is_cjk)
+            && chars.peek().copied().is_some_and(is_cjk);
+        if !between_cjk {
+            stripped.push(character);
+        }
+    }
+    stripped.trim().to_owned()
+}
+
+/// The CJK ranges the upstream normalization treats as text body.
+fn is_cjk(character: char) -> bool {
+    matches!(character,
+        '\u{4E00}'..='\u{9FFF}'   // CJK Unified Ideographs
+        | '\u{3040}'..='\u{30FF}' // Hiragana + Katakana
+        | '\u{3400}'..='\u{4DBF}' // CJK Extension A
+        | '\u{AC00}'..='\u{D7AF}' // Hangul syllables
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
+    fn normalize_text_applies_the_upstream_cleanup_pipeline() {
+        // NFKC folds the fullwidth exclamation the model may emit.
+        assert_eq!(normalize_text("\u{FF01}"), "!");
+        // CR/LF/TAB and repeated spaces collapse to one.
+        assert_eq!(normalize_text("a\r\n\tb   c"), "a b c");
+        // Outer whitespace is trimmed.
+        assert_eq!(normalize_text("  x  "), "x");
+        // Empty input stays empty.
+        assert_eq!(normalize_text(""), "");
+    }
+
+    /// NFKC runs before the CJK-whitespace pass, so its mapping decides which
+    /// characters `is_cjk` can ever see. These values were checked against
+    /// Python `unicodedata.normalize("NFKC", ...)`, which is what the upstream
+    /// pipeline runs; `icu_normalizer` must keep agreeing with it or the
+    /// normalized text silently diverges from the reference.
+    #[test]
+    fn normalize_text_matches_the_reference_nfkc_mapping() {
+        // No decomposition: NFKC leaves it alone, so it stays outside the CJK
+        // class and spaces beside it are preserved, exactly as upstream.
+        assert_eq!(normalize_text("\u{FA11}"), "\u{FA11}");
+        // A compatibility ideograph that *does* decompose, into U+7406 (理).
+        assert_eq!(normalize_text("\u{F9E4}"), "\u{7406}");
+        // Ideographic space becomes an ordinary space, then folds with the run.
+        assert_eq!(normalize_text("\u{3000}a"), "a");
+    }
+
+    #[test]
+    fn normalize_text_strips_whitespace_between_cjk_characters() {
+        // The reference's single non-overlapping pass leaves an alternating gap
+        // here; the port strips every CJK-internal space.
+        assert_eq!(normalize_text("\u{6F22} \u{5B57} \u{6F22}"), "\u{6F22}\u{5B57}\u{6F22}");
+        // Latin words keep their spaces.
+        assert_eq!(normalize_text("hello world"), "hello world");
+        // A space between CJK and Latin is preserved.
+        assert_eq!(
+            normalize_text("\u{6F22} x \u{5B57}"),
+            "\u{6F22} x \u{5B57}"
+        );
+    }
+
+    #[test]
     fn resize_budget_matches_upstream_binary_search() {
-        // A square image fills the 256-patch budget with a 16x16 patch grid.
+        // A square image fills the 256-patch budget argument with a 16x16 patch grid.
         assert_eq!(
             get_image_size_for_max_num_patches(1024, 1024, 16, 256),
             (256, 256)
