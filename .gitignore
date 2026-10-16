@@ -82,3 +82,6 @@ koharu-memory-audit-*/
 # Local documentation output
 /packages/docs/.mintlify/
 /packages/docs/site/
+/.claude
+/plan
+/plan
