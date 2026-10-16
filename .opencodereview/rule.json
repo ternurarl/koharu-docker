@@ -1,0 +1,38 @@
+{
+  "exclude": [
+    "crates/koharu-app/**",
+    "crates/koharu-desktop/**",
+    "crates/koharu-canvas/**",
+    "crates/koharu-psd/**",
+    "crates/koharu-agent/**",
+    "packages/**",
+    "crates/koharu/icons/**",
+    "crates/koharu/capabilities/**",
+    "crates/koharu/tauri*.conf.json",
+    "crates/koharu/Entitlements.plist",
+    ".opencodereview/**",
+    "scan-*.md"
+  ],
+  "rules": [
+    {
+      "path": "crates/koharu-rpc/**",
+      "rule": "Headless REST + SSE server. Check axum routing, SSE frame contract (snapshot then live tail, monotonic ids), request validation, error-to-HTTP-status mapping, multipart/thumbnail handling, and that no Tauri/desktop assumption leaks in."
+    },
+    {
+      "path": "crates/koharu-pipeline/**",
+      "rule": "Pipeline engine for a headless server. Verify stage scheduling and ordering, subprocess handoff and memory release, resource accounting, cancellation/timeout, and correctness under concurrency."
+    },
+    {
+      "path": "crates/koharu-ml/**",
+      "rule": "ML inference. Check tensor shape and lifetime correctness, device selection (cpu/gpu), error propagation, and that no GUI-only or window-system assumption is required."
+    },
+    {
+      "path": "crates/koharu/src/main.rs",
+      "rule": "Process entrypoint with gui/headless cargo features. Verify the feature gates are exhaustive and correct, that the headless path never touches Tauri, and that flag parsing and exit codes behave."
+    },
+    {
+      "path": "crates/koharu/build.rs",
+      "rule": "Build script gated on the gui feature. Verify tauri_build only runs for gui and that a headless-only build never requires Tauri or its frontend assets."
+    }
+  ]
+}

@@ -1,6 +1,6 @@
 # Koharu 升级 Hayai OCR v2.5 Nova 技术迁移指南与 Agent 上下文包
 
-本文档为本地编码 Agent 提供在 [koharu-rs/koharu](https://www.google.com/search?q=https%3A%2F%2Fgithub.com%2Fkoharu-rs%2Fkoharu) 中将 OCR 模块从 [JustANormalTinkerer/hayai-ocr-v2](https://www.google.com/search?q=https%3A%2F%2Fhuggingface.co%2FJustANormalTinkerer%2Fhayai-ocr-v2) 升级至 [JustANormalTinkerer/hayai-ocr-v2.5-nova](https://www.google.com/search?q=https%3A%2F%2Fhuggingface.co%2FJustANormalTinkerer%2Fhayai-ocr-v2.5-nova) 的完整上下文、架构契约对比、逐步 Rust 代码实现以及验证流程。
+本文档为本地编码 Agent 提供在 [koharu-rs/koharu](https%3A%2F%2Fgithub.com%2Fkoharu-rs%2Fkoharu) 中将 OCR 模块从 [JustANormalTinkerer/hayai-ocr-v2](https%3A%2F%2Fhuggingface.co%2FJustANormalTinkerer%2Fhayai-ocr-v2) 升级至 [JustANormalTinkerer/hayai-ocr-v2.5-nova](https%3A%2F%2Fhuggingface.co%2FJustANormalTinkerer%2Fhayai-ocr-v2.5-nova) 的完整上下文、架构契约对比、逐步 Rust 代码实现以及验证流程。
 
 ## 1. 给本地 Agent 的任务指令（可直接复制作为 Prompt）
 
@@ -17,7 +17,7 @@
 
 | 维度 | 当前实现 (Hayai OCR v2 / v2.1) | 目标实现 (Hayai OCR v2.5 Nova) |
 | :--- | :--- | :--- |
-| **Hugging Face Repo ID** | [JustANormalTinkerer/hayai-ocr-v2](https://www.google.com/search?q=https%3A%2F%2Fhuggingface.co%2FJustANormalTinkerer%2Fhayai-ocr-v2) | [JustANormalTinkerer/hayai-ocr-v2.5-nova](https://www.google.com/search?q=https%3A%2F%2Fhuggingface.co%2FJustANormalTinkerer%2Fhayai-ocr-v2.5-nova) |
+| **Hugging Face Repo ID** | [JustANormalTinkerer/hayai-ocr-v2](https%3A%2F%2Fhuggingface.co%2FJustANormalTinkerer%2Fhayai-ocr-v2) | [JustANormalTinkerer/hayai-ocr-v2.5-nova](https%3A%2F%2Fhuggingface.co%2FJustANormalTinkerer%2Fhayai-ocr-v2.5-nova) |
 | **Commit Revision SHA** | `4a4ce477c9a8841f208b94e1d9ed5c0938965e05` | `2803d0dc005fa4396ab1e7c5a472d2c450a247f7` (或 ONNX 对齐版 `e34d7755ed11e626c5ba39544af5d66f20ee57cc`) |
 | **下载文件清单** | `config.json`, `model.safetensors` (623 MB), `tokenizer.json` | `config.json`, `model.safetensors` (628 MB), `tokenizer.json` |
 | **CPU 推理精度** | `koharu_torch::Kind::Float` (FP32) | `koharu_torch::Kind::Float` (FP32) |
@@ -53,9 +53,9 @@
 
 > **注意**：`num_ids_classes: 226` 是训练期用于汉字部件（IDS）辅助分类头的超参数，推理阶段完全不使用，无任何计算开销。
 
-### 2.3 参考 Python 实现与 Tensor 契约（源自 `modeling_hayai.py` 与 [bixii/hayai-ocr-v2.5-nova-onnx](https://www.google.com/search?q=https%3A%2F%2Fhuggingface.co%2Fbixii%2Fhayai-ocr-v2.5-nova-onnx)）
+### 2.3 参考 Python 实现与 Tensor 契约（源自 `modeling_hayai.py` 与 [bixii/hayai-ocr-v2.5-nova-onnx](https%3A%2F%2Fhuggingface.co%2Fbixii%2Fhayai-ocr-v2.5-nova-onnx)）
 
-在 [JustANormalTinkerer/hayai-ocr-v2.5-nova](https://www.google.com/search?q=https%3A%2F%2Fhuggingface.co%2FJustANormalTinkerer%2Fhayai-ocr-v2.5-nova) 的 `modeling_hayai.py` 中，`DSCProjector` 的数学定义与计算顺序如下：
+在 [JustANormalTinkerer/hayai-ocr-v2.5-nova](https%3A%2F%2Fhuggingface.co%2FJustANormalTinkerer%2Fhayai-ocr-v2.5-nova) 的 `modeling_hayai.py` 中，`DSCProjector` 的数学定义与计算顺序如下：
 
 1. **输入特征与网格**：
    * 视觉编码器输出：`visual_features`，形状为 `[1, N_max, 768]`，其中前 `H * W` 个位置是有效 Patch（`H = spatial_shape[0]`, `W = spatial_shape[1]`）。
