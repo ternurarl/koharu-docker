@@ -9,6 +9,7 @@ use koharu_ml::{
     baberu_ocr::BaberuOcr, hayai_ocr::HayaiOcr, manga_ocr::MangaOcr,
     paddle_ocr_vl::PaddleOCRVLTask, paddle_ocr_vl_quantized::PaddleOCRVLQuantized,
 };
+use koharu_renderer::detect_language_tag;
 use koharu_scene::{
     Authored, EntityId, Geometry, LanguageTag, OcrAnalysis, Origin, RecognizedFrom, Region,
     RegionSpec, SourceText, TextDirection, TextRegion,
@@ -183,7 +184,7 @@ impl Model {
             let language = result
                 .previous
                 .and_then(|value| value.language)
-                .or_else(|| LanguageTag::new("ja-JP").ok());
+                .or_else(|| LanguageTag::new(detect_language_tag(&result.text)).ok());
             edit.set(
                 result.content,
                 &SourceText {

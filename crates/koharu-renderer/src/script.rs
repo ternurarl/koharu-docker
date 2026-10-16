@@ -99,6 +99,40 @@ pub(crate) fn is_chinese_or_japanese_text(text: &str) -> bool {
     })
 }
 
+/// Maps `text` to a BCP-47 language tag from the Unicode scripts it contains.
+///
+/// Hangul and kana each identify a single language, so they outrank Han
+/// (shared by Japanese and Chinese) and Latin (digits and names routinely
+/// mixed into CJK text). Han maps to `ja-JP` on purpose: a pure-kanji line is
+/// identical in Japanese and Chinese, and this fork only feeds Japanese source
+/// images, so kanji is deliberately never disambiguated to `zh`. Unknown
+/// scripts and empty text keep the historical `ja-JP` fallback.
+pub fn detect_language_tag(text: &str) -> &'static str {
+    let script_map = CodePointMapData::<IcuScript>::new();
+    let mut has_hangul = false;
+    let mut has_kana = false;
+    let mut has_han = false;
+    let mut has_latin = false;
+    for character in text.chars() {
+        match script_map.get(character) {
+            IcuScript::Hangul => has_hangul = true,
+            IcuScript::Hiragana | IcuScript::Katakana => has_kana = true,
+            IcuScript::Han => has_han = true,
+            IcuScript::Latin => has_latin = true,
+            _ => {}
+        }
+    }
+    if has_hangul {
+        "ko-KR"
+    } else if has_kana || has_han {
+        "ja-JP"
+    } else if has_latin {
+        "en-US"
+    } else {
+        "ja-JP"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -132,5 +166,31 @@ mod tests {
         assert!(is_chinese_or_japanese_text("繁體中文"));
         assert!(!is_chinese_or_japanese_text("한국어"));
         assert!(!is_chinese_or_japanese_text("English"));
+    }
+
+    #[test]
+    fn hangul_outranks_latin_for_language_tag() {
+        assert_eq!(detect_language_tag("한국어"), "ko-KR");
+        assert_eq!(detect_language_tag("B6층 모험가들이"), "ko-KR");
+    }
+
+    #[test]
+    fn japanese_scripts_stay_japanese() {
+        assert_eq!(detect_language_tag("ひらがな"), "ja-JP");
+        assert_eq!(detect_language_tag("カタカナ"), "ja-JP");
+        assert_eq!(detect_language_tag("日本語"), "ja-JP");
+    }
+
+    #[test]
+    fn mixed_kana_kanji_and_digits_stay_japanese() {
+        assert_eq!(detect_language_tag("第3巻の発売日は2024年"), "ja-JP");
+    }
+
+    #[test]
+    fn latin_detects_english_and_unknown_falls_back_to_japanese() {
+        assert_eq!(detect_language_tag("English"), "en-US");
+        assert_eq!(detect_language_tag("مرحبا"), "ja-JP");
+        assert_eq!(detect_language_tag("123"), "ja-JP");
+        assert_eq!(detect_language_tag(""), "ja-JP");
     }
 }
