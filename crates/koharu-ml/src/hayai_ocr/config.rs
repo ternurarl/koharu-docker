@@ -1,7 +1,7 @@
 //! Hayai OCR configuration.
 //!
 //! Upstream configuration:
-//! https://huggingface.co/JustANormalTinkerer/hayai-ocr-v2/blob/4a4ce477c9a8841f208b94e1d9ed5c0938965e05/configuration_hayai.py
+//! https://huggingface.co/JustANormalTinkerer/hayai-ocr-v2.5-nova/blob/2803d0dc005fa4396ab1e7c5a472d2c450a247f7/configuration_hayai.py
 //! The vision encoder is the `Siglip2VisionModel` instantiated by
 //! `modeling_hayai.HayaiModel` from `google/siglip2-base-patch16-naflex`, whose
 //! released config only overrides the model type, so every value below is the
@@ -27,7 +27,22 @@ pub(super) mod siglip2 {
     pub const POSITION_EMBEDDING_SIZE: i64 = 16;
     pub const LAYER_NORM_EPS: f64 = 1e-6;
     /// Maximum number of 16x16 patches emitted by the SigLIP2 image processor.
-    pub const MAX_NUM_PATCHES: usize = 256;
+    ///
+    /// This is the spatial budget of the whole network, so it is the main
+    /// quality/latency knob of the Nova release (upstream `max_num_patches`):
+    ///
+    /// | `MAX_NUM_PATCHES` | decoder visual tokens | CER | relative latency |
+    /// | ---: | ---: | ---: | ---: |
+    /// | 256 (throughput) | `<= 64` | 4.95% | 1.00x |
+    /// | **384** (current; Nova's balanced default) | `<= 96` | 3.65% | ~1.19x |
+    /// | 512 (upstream's quality pick) | `<= 128` | 3.10% | ~1.34x |
+    ///
+    /// 384 is the release default because 256 regresses against the v2.1
+    /// checkpoint this replaces (CER 4.95% vs 3.23%). 512 is the only tier that
+    /// beats v2.1 outright and is worth the ~34% latency cost on dense or
+    /// vertically-set crops. The decoder token counts above assume a balanced
+    /// patch grid; see [`decoder_vision_grid`] for the exact mapping.
+    pub const MAX_NUM_PATCHES: usize = 384;
 }
 
 /// Decoder constants of `VisualCausalOCRDecoder`; upstream hardcodes them in
@@ -37,6 +52,26 @@ pub(super) mod decoder {
     pub const KEY_VALUE_HEADS: i64 = 2;
     pub const HEAD_DIM: i64 = 64;
     pub const ROPE_THETA: f64 = 10_000.0;
+}
+
+/// Spatial downsampling of the Nova `DSCProjector`: a `2x2` pixel unshuffle
+/// merges every `SPATIAL_DOWNSCALE^2` patches into one decoder visual token.
+pub(super) const SPATIAL_DOWNSCALE: i64 = 2;
+
+/// Decoder visual grid of a `patch_height x patch_width` patch grid after the
+/// `DSCProjector` unshuffle: `ceil(H / 2) x ceil(W / 2)`, i.e. `H_out * W_out`
+/// visual tokens.
+///
+/// Upstream keeps a batch-wide static buffer of `MAX_NUM_PATCHES / 4` slots and
+/// masks the tail; Koharu runs one crop at a time and sizes the sequence to the
+/// exact count instead, so there is nothing to pad or mask. For a balanced grid
+/// that count is `MAX_NUM_PATCHES / 4` (64 at 256 patches), but an extreme
+/// aspect ratio raises it: a `1 x 256` strip compresses to `1 x 128`.
+pub(super) fn decoder_vision_grid(patch_height: i64, patch_width: i64) -> (i64, i64) {
+    (
+        (patch_height + SPATIAL_DOWNSCALE - 1) / SPATIAL_DOWNSCALE,
+        (patch_width + SPATIAL_DOWNSCALE - 1) / SPATIAL_DOWNSCALE,
+    )
 }
 
 #[derive(Debug, Clone, Deserialize)]

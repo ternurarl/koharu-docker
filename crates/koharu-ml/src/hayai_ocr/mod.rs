@@ -11,10 +11,10 @@ use crate::backend::TryIntoDevice;
 use self::{
     config::HayaiConfig,
     model::Model,
-    processor::{ImageProcessor, Tokenizer},
+    processor::{ImageProcessor, Tokenizer, normalize_text},
 };
 
-crate::model_repository!("JustANormalTinkerer/hayai-ocr-v2" @ "4a4ce477c9a8841f208b94e1d9ed5c0938965e05" {
+crate::model_repository!("JustANormalTinkerer/hayai-ocr-v2.5-nova" @ "2803d0dc005fa4396ab1e7c5a472d2c450a247f7" {
     CONFIG = "config.json",
     WEIGHTS = "model.safetensors",
     TOKENIZER = "tokenizer.json",
@@ -22,9 +22,12 @@ crate::model_repository!("JustANormalTinkerer/hayai-ocr-v2" @ "4a4ce477c9a8841f2
 
 /// Fast crop-level OCR for Japanese, Chinese, Korean, and English text.
 ///
-/// Port of the Hayai OCR v2 vision-to-text model: a SigLIP2 NaFlex encoder
-/// paired with a small GQA transformer decoder over a shared visual/textual
-/// prefix with block-causal attention and 2D multimodal RoPE.
+/// Port of the Hayai OCR v2.5 Nova vision-to-text model: a SigLIP2 NaFlex
+/// encoder paired with a small GQA transformer decoder over a shared
+/// visual/textual prefix with block-causal attention and 2D multimodal RoPE.
+/// Nova's `DSCProjector` merges every 2x2 patch block into one decoder token,
+/// so the visual prefix is a quarter of v2's and the 2D RoPE grid is the
+/// downsampled one.
 #[derive(Debug)]
 pub struct HayaiOcr {
     model: Model,
@@ -85,7 +88,9 @@ impl HayaiOcr {
         koharu_torch::no_grad(|| {
             let input = self.processor.preprocess(image)?;
             let token_ids = self.model.generate(&input, &self.tokenizer, self.device)?;
-            self.tokenizer.decode(&token_ids)
+            self.tokenizer
+                .decode(&token_ids)
+                .map(|text| normalize_text(&text))
         })
     }
 }
