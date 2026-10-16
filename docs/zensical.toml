@@ -109,6 +109,7 @@ nav = [
       "development/architecture.md",
       "development/scene-and-storage.md",
       "development/pipeline-rendering-and-desktop.md",
+      "development/model-ports.md",
     ] },
     { "日本語" = [
       "ja-JP/development/contributing.md",
@@ -116,6 +117,7 @@ nav = [
       "ja-JP/development/architecture.md",
       "ja-JP/development/scene-and-storage.md",
       "ja-JP/development/pipeline-rendering-and-desktop.md",
+      "ja-JP/development/model-ports.md",
     ] },
     { "简体中文" = [
       "zh-CN/development/contributing.md",
@@ -123,6 +125,7 @@ nav = [
       "zh-CN/development/architecture.md",
       "zh-CN/development/scene-and-storage.md",
       "zh-CN/development/pipeline-rendering-and-desktop.md",
+      "zh-CN/development/model-ports.md",
     ] },
   ] },
 ]
