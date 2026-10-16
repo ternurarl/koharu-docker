@@ -25,6 +25,7 @@ pub use frame::{
 pub use layout::WritingMode;
 pub use raster::{DownsampleFilter, Raster, RasterOptions};
 pub use renderer::Renderer;
+pub use script::detect_language_tag;
 pub use types::{FontFace, FontFamily, FontMetadata, FontRange, FontSource, FontStyle, TextAlign};
 
 pub(crate) use layout::{HyphenationPolicy, LayoutRun, TextLayout};
