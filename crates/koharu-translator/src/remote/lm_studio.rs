@@ -67,9 +67,7 @@ pub(super) async fn translate(
         max_tokens: generation.max_tokens,
         frequency_penalty: generation.frequency_penalty,
         presence_penalty: generation.presence_penalty,
-        reasoning_effort: generation
-            .reasoning
-            .map(|enabled| if enabled { "medium" } else { "none" }),
+        reasoning_effort: reasoning_effort(generation.reasoning),
         response_format: ResponseFormat {
             kind: "json_schema",
             json_schema: JsonSchema {
@@ -136,6 +134,16 @@ fn endpoint(base_url: Option<&Url>, suffix: &str) -> String {
     )
 }
 
+/// Thinking is off unless the caller asked for it. An omitted field hands the
+/// choice to the endpoint, which thinks by default on reasoning-capable models.
+fn reasoning_effort(reasoning: Option<bool>) -> &'static str {
+    if reasoning.unwrap_or(false) {
+        "medium"
+    } else {
+        "none"
+    }
+}
+
 #[derive(Serialize)]
 struct ChatRequest<'a> {
     model: &'a str,
@@ -150,8 +158,7 @@ struct ChatRequest<'a> {
     frequency_penalty: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     presence_penalty: Option<f32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    reasoning_effort: Option<&'static str>,
+    reasoning_effort: &'static str,
     response_format: ResponseFormat,
 }
 
@@ -325,7 +332,7 @@ mod tests {
             max_tokens: Some(1024),
             frequency_penalty: None,
             presence_penalty: None,
-            reasoning_effort: Some("none"),
+            reasoning_effort: "none",
             response_format: ResponseFormat {
                 kind: "json_schema",
                 json_schema: JsonSchema {
@@ -339,6 +346,8 @@ mod tests {
 
         assert_eq!(value["max_tokens"], 1024);
         assert_eq!(value["reasoning_effort"], "none");
+        assert_eq!(reasoning_effort(None), "none");
+        assert_eq!(reasoning_effort(Some(true)), "medium");
         assert_eq!(value["response_format"]["type"], "json_schema");
         assert_eq!(value["response_format"]["json_schema"]["strict"], true);
     }
