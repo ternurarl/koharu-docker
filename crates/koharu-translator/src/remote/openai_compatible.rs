@@ -70,11 +70,9 @@ pub(super) async fn translate(
         // Divergence note (absorbed upstream): the fork used to send an explicit
         // thinking = enabled/disabled field so compatible endpoints would not turn
         // reasoning on when the field was omitted. Upstream carries the same intent
-        // through reasoning_effort, which is always present and is none when
-        // reasoning is off, so the separate field is gone.
-        reasoning_effort: generation
-            .reasoning
-            .map(|enabled| if enabled { "medium" } else { "none" }),
+        // through reasoning_effort. It is always present - "none" when reasoning is
+        // off *or unset* - because an omitted field hands the choice to the endpoint.
+        reasoning_effort: reasoning_effort(generation.reasoning),
         response_format: ResponseFormat {
             kind: "json_schema",
             json_schema: JsonSchema {
@@ -138,6 +136,16 @@ fn endpoint(base_url: Option<&Url>, suffix: &str) -> String {
     )
 }
 
+/// Thinking is off unless the caller asked for it; see the divergence note in
+/// `translate` for why the field cannot simply be omitted.
+fn reasoning_effort(reasoning: Option<bool>) -> &'static str {
+    if reasoning.unwrap_or(false) {
+        "medium"
+    } else {
+        "none"
+    }
+}
+
 #[derive(Serialize)]
 struct ChatRequest<'a> {
     model: &'a str,
@@ -152,8 +160,7 @@ struct ChatRequest<'a> {
     frequency_penalty: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     presence_penalty: Option<f32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    reasoning_effort: Option<&'static str>,
+    reasoning_effort: &'static str,
     response_format: ResponseFormat,
 }
 
@@ -253,7 +260,7 @@ mod tests {
             max_tokens: Some(1024),
             frequency_penalty: None,
             presence_penalty: None,
-            reasoning_effort: Some("none"),
+            reasoning_effort: "none",
             response_format: ResponseFormat {
                 kind: "json_schema",
                 json_schema: JsonSchema {
@@ -273,6 +280,14 @@ mod tests {
             value["response_format"]["json_schema"]["schema"]["properties"]["translations"]["maxItems"],
             2
         );
+    }
+
+    #[test]
+    fn reasoning_effort_is_none_when_unset() {
+        for reasoning in [None, Some(false)] {
+            assert_eq!(reasoning_effort(reasoning), "none");
+        }
+        assert_eq!(reasoning_effort(Some(true)), "medium");
     }
 
     #[test]

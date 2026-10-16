@@ -64,9 +64,7 @@ pub(super) async fn translate(
         system: &system,
         messages: [Message::user(&user, request.image.as_deref())?],
         temperature: generation.temperature,
-        thinking: generation.reasoning.map(|enabled| ThinkingConfig {
-            kind: if enabled { "adaptive" } else { "disabled" },
-        }),
+        thinking: thinking_config(generation.reasoning),
         output_config: OutputConfig {
             format: JsonOutputFormat {
                 kind: "json_schema",
@@ -99,8 +97,7 @@ struct Request<'a> {
     messages: [Message<'a>; 1],
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    thinking: Option<ThinkingConfig>,
+    thinking: ThinkingConfig,
     output_config: OutputConfig,
 }
 
@@ -108,6 +105,18 @@ struct Request<'a> {
 struct ThinkingConfig {
     #[serde(rename = "type")]
     kind: &'static str,
+}
+
+/// Thinking is off unless the caller asked for it. The field is always part of
+/// the request: an omitted `thinking` hands the choice to the endpoint.
+fn thinking_config(reasoning: Option<bool>) -> ThinkingConfig {
+    ThinkingConfig {
+        kind: if reasoning.unwrap_or(false) {
+            "adaptive"
+        } else {
+            "disabled"
+        },
+    }
 }
 
 #[derive(Serialize)]
@@ -230,7 +239,7 @@ mod tests {
             system: "system",
             messages: [Message::user("translate", None).unwrap()],
             temperature: None,
-            thinking: Some(ThinkingConfig { kind: "adaptive" }),
+            thinking: ThinkingConfig { kind: "adaptive" },
             output_config: OutputConfig {
                 format: JsonOutputFormat {
                     kind: "json_schema",
@@ -246,6 +255,16 @@ mod tests {
             value["output_config"]["format"]["schema"]["properties"]["translations"]["maxItems"],
             2
         );
+    }
+
+    #[test]
+    fn thinking_is_disabled_when_unset() {
+        for reasoning in [None, Some(false)] {
+            let value = serde_json::to_value(thinking_config(reasoning)).unwrap();
+            assert_eq!(value["type"], "disabled");
+        }
+        let value = serde_json::to_value(thinking_config(Some(true))).unwrap();
+        assert_eq!(value["type"], "adaptive");
     }
 
     #[test]

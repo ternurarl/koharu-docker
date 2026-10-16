@@ -93,25 +93,7 @@ pub(super) async fn translate(
         generation_config: GenerationConfig {
             temperature: generation.temperature,
             max_output_tokens: generation.max_tokens,
-            thinking_config: generation.reasoning.map(|enabled| ThinkingConfig {
-                thinking_budget: model.starts_with("gemini-2.5").then(|| {
-                    if enabled {
-                        -1
-                    } else if model.starts_with("gemini-2.5-pro") {
-                        // Gemini 2.5 Pro cannot disable thinking; 128 is its minimum budget.
-                        128
-                    } else {
-                        0
-                    }
-                }),
-                thinking_level: (!model.starts_with("gemini-2.5")).then_some(if enabled {
-                    "high"
-                } else if model.starts_with("gemma-4") {
-                    "minimal"
-                } else {
-                    "low"
-                }),
-            }),
+            thinking_config: thinking_config(generation.reasoning, model),
             response_mime_type: "application/json",
             response_json_schema: schema,
         },
@@ -186,8 +168,7 @@ struct GenerationConfig {
     temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_output_tokens: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    thinking_config: Option<ThinkingConfig>,
+    thinking_config: ThinkingConfig,
     response_mime_type: &'static str,
     response_json_schema: serde_json::Value,
 }
@@ -226,6 +207,32 @@ struct ModelsResponse {
     models: Vec<ListedModel>,
 }
 
+/// Thinking is off unless the caller asked for it. Gemini wants an explicit
+/// control either way: omitting `thinking_config` leaves the endpoint default,
+/// which thinks on the thinking-capable models.
+fn thinking_config(reasoning: Option<bool>, model: &str) -> ThinkingConfig {
+    let enabled = reasoning.unwrap_or(false);
+    ThinkingConfig {
+        thinking_budget: model.starts_with("gemini-2.5").then(|| {
+            if enabled {
+                -1
+            } else if model.starts_with("gemini-2.5-pro") {
+                // Gemini 2.5 Pro cannot disable thinking; 128 is its minimum budget.
+                128
+            } else {
+                0
+            }
+        }),
+        thinking_level: (!model.starts_with("gemini-2.5")).then_some(if enabled {
+            "high"
+        } else if model.starts_with("gemma-4") {
+            "minimal"
+        } else {
+            "low"
+        }),
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ListedModel {
@@ -245,13 +252,13 @@ mod tests {
         let config = GenerationConfig {
             temperature: None,
             max_output_tokens: None,
-            thinking_config: None,
+            thinking_config: thinking_config(None, "gemini-2.0-flash"),
             response_mime_type: "application/json",
             response_json_schema: prompt::output_schema(2),
         };
         let value = serde_json::to_value(config).unwrap();
         assert_eq!(value["responseMimeType"], "application/json");
-        assert!(value.get("thinkingConfig").is_none());
+        assert_eq!(value["thinkingConfig"]["thinkingLevel"], "low");
         assert_eq!(
             value["responseJsonSchema"]["properties"]["translations"]["items"]["properties"]["id"]
                 ["maximum"],

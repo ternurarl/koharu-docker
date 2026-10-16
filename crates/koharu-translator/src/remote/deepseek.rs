@@ -79,9 +79,7 @@ pub(super) async fn translate(
         temperature: generation.temperature.or(Some(1.3)),
         top_p: generation.top_p,
         max_tokens: generation.max_tokens,
-        thinking: generation.reasoning.map(|enabled| ThinkingConfig {
-            kind: if enabled { "enabled" } else { "disabled" },
-        }),
+        thinking: thinking_config(generation.reasoning),
         response_format: ResponseFormat {
             kind: "json_object",
         },
@@ -109,8 +107,7 @@ pub(super) async fn translate(
 struct ChatRequest<'a> {
     model: &'a str,
     messages: [Message; 2],
-    #[serde(skip_serializing_if = "Option::is_none")]
-    thinking: Option<ThinkingConfig>,
+    thinking: ThinkingConfig,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
     response_format: ResponseFormat,
@@ -124,6 +121,19 @@ struct ChatRequest<'a> {
 struct ThinkingConfig {
     #[serde(rename = "type")]
     kind: &'static str,
+}
+
+/// Thinking is off unless the caller asked for it. The field is always part of
+/// the request: an omitted `thinking` hands the choice to the endpoint, and
+/// DeepSeek's thinking-capable models default to reasoning on.
+fn thinking_config(reasoning: Option<bool>) -> ThinkingConfig {
+    ThinkingConfig {
+        kind: if reasoning.unwrap_or(false) {
+            "enabled"
+        } else {
+            "disabled"
+        },
+    }
 }
 
 #[derive(Serialize)]
@@ -200,7 +210,7 @@ mod tests {
                     content: MessageContent::Text("translate".to_owned()),
                 },
             ],
-            thinking: Some(ThinkingConfig { kind: "disabled" }),
+            thinking: ThinkingConfig { kind: "disabled" },
             max_tokens: Some(1024),
             response_format: ResponseFormat {
                 kind: "json_object",
@@ -216,5 +226,15 @@ mod tests {
         assert!(value.get("json_schema").is_none());
         assert!(value.get("frequency_penalty").is_none());
         assert!(value.get("presence_penalty").is_none());
+    }
+
+    #[test]
+    fn thinking_is_disabled_when_unset() {
+        for reasoning in [None, Some(false)] {
+            let value = serde_json::to_value(thinking_config(reasoning)).unwrap();
+            assert_eq!(value["type"], "disabled");
+        }
+        let value = serde_json::to_value(thinking_config(Some(true))).unwrap();
+        assert_eq!(value["type"], "enabled");
     }
 }
