@@ -8,7 +8,7 @@ use crate::Stage;
 ///
 /// Local stages stay at one: running several pages through the same model at
 /// once multiplies model residency, and multi-page concurrency is out of scope
-/// for the stage overlap work (`plan/pipeline-stage-overlap-plan.md`).
+/// for the stage overlap work.
 ///
 /// Translation is the exception. A remote request holds neither a local model
 /// nor the accelerator lane, so two in flight at once only bounds how many
