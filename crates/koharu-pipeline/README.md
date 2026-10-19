@@ -104,9 +104,10 @@ page 1 OCR commits        translation page 1
 ```
 
 Page priority prevents an upstream model from racing arbitrarily far ahead,
-while independent page branches use otherwise idle models. The number of
-active pages is bounded by the selected stage count, so the scheduler keeps a
-small rolling window instead of filling an unbounded upstream queue.
+while independent page branches use otherwise idle models. In-flight work is
+bounded per stage by `concurrency(stage)` — one job for each local stage, four
+for remote translation — so the scheduler keeps a small rolling window instead
+of filling an unbounded upstream queue.
 
 Stages return an empty patch when their page has no applicable input. A page
 with no detected text skips OCR and translation work; an empty removal mask

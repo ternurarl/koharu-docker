@@ -8,14 +8,17 @@ use crate::Stage;
 ///
 /// Local stages stay at one: running several pages through the same model at
 /// once multiplies model residency, and multi-page concurrency is out of scope
-/// for the stage overlap work.
+/// for the stage overlap work. On an accelerator device it would not even buy
+/// throughput: `AcceleratorGate` is one lane (`Semaphore::new(1)`), so a second
+/// page of the same stage only queues behind the first while its decoded image
+/// stays alive (`Execution::images`) and its stage model cannot be released.
 ///
 /// Translation is the exception. A remote request holds neither a local model
-/// nor the accelerator lane, so two in flight at once only bounds how many
+/// nor the accelerator lane, so four in flight at once only bounds how many
 /// remote translation requests may be outstanding at the same time. What the
 /// configured provider does under that load — rate limiting above all — is
-/// unverified.
-const TRANSLATION_CONCURRENCY: usize = 2;
+/// unverified, and four outstanding requests press it harder than two did.
+const TRANSLATION_CONCURRENCY: usize = 4;
 
 const fn concurrency(stage: Stage) -> usize {
     match stage {
@@ -306,7 +309,7 @@ mod tests {
 
     #[test]
     fn translation_concurrency_is_capped() {
-        let pages = pages(3);
+        let pages = pages(TRANSLATION_CONCURRENCY + 1);
         let stages = [Stage::Ocr, Stage::Translation];
         let mut scheduler = Scheduler::new(&pages, &stages);
         let mut running = BTreeMap::new();
@@ -328,7 +331,7 @@ mod tests {
         finish(&mut scheduler, &mut running, pages[0], Stage::Translation);
         assert_eq!(
             scheduler.start_next(&running),
-            Some((pages[2], Stage::Translation))
+            Some((pages[TRANSLATION_CONCURRENCY], Stage::Translation))
         );
     }
 

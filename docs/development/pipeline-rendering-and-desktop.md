@@ -15,7 +15,7 @@ flowchart LR
   detection --> inpainting["Inpainting"]
 ```
 
-An execution unit is one stage on one page. Pages stay in project order, but execution is batched by stage: every requested page finishes the current stage before the next stage starts. A two-page run therefore completes both detection jobs before either OCR job, and both OCR jobs before either translation job.
+An execution unit is one stage on one page. Pages enter in project order, and once detection commits for a page that page's later branches become ready immediately — there is no global barrier that waits for every page's detection. OCR, translation, and inpainting therefore interleave across pages.
 
 Each stage produces a semantic scene patch. The application commits it immediately, synchronizes the current canvas, and groups all revisions from one invocation into one undo step.
 
@@ -23,9 +23,9 @@ Each stage produces a semantic scene patch. The application commits it immediate
 
 Accelerator inference uses one admission lane because representative heterogeneous overlap reduced throughput through compute and memory-bandwidth contention. CPU-only execution can retain independent per-model lanes.
 
-Each requested stage loads its model for that batch and releases it before the next stage can load. Failure and stop close the unfinished jobs in the active batch, then release its model; the failure path may unload first, and the batch-end release then observes an empty model cell. Remote translation has no local model, so its release reports that nothing was resident.
+Models load on demand and stay resident for reuse. A stage's model is released once its work has drained — no job of that stage is still running and none remains — so a model can outlive a single page, and models of overlapping stages can be resident at once. Failure and stop close the unfinished jobs, then release what is still resident; the failure path may unload first. Remote translation has no local model, so its release reports that nothing was resident. A stage that runs out of device memory is retried once after the other models are unloaded.
 
-A page image cache lives only for the active stage job. The cache is removed when the page finishes that stage or when the stage batch ends, rather than remaining until every later stage on the page has finished. CPU execution still has no accelerator admission lane.
+A page's decoded image cache lives from detection through inpainting: it is dropped when that page finishes every stage, and every cache is cleared when the run ends. Overlapping jobs may still decode from a cache another stage has already finished with, so per-stage cleanup would only force a re-decode. CPU execution still has no accelerator admission lane.
 
 Stopping is cooperative. No new stage starts after the stop request; an active native call returns safely, and its result is discarded if it has not committed.
 
