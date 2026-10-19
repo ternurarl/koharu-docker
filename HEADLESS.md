@@ -67,11 +67,18 @@ Notes:
   packages under data/packages.
 - Configuration stays at ~/.koharu/config.toml (koharu_config), which is
   outside the data volume: mount koharu-config:/home/koharu/.koharu or a
-  container recreation resets all config to defaults. Provider secrets live
-  in the Linux keyring and are lost on every restart regardless.
-- seccomp=unconfined is required because koharu-secrets stores provider API
-  keys in the Linux keyutils keyring (keyctl/add_key). Without it, provider
-  secret endpoints fail with "failed to initialize Linux Keyutils".
+  container recreation resets all config to defaults. Credentials never enter
+  that file.
+- deepseek and openai-compatible credentials are held in the server's memory
+  for the one task that uses them: PUT /config/providers/{id}/secret before
+  every run, and the server drops the key as soon as the task reaches
+  Completed, Cancelled, or Failed. Nothing is written to disk, so there is no
+  re-PUT-after-restart step - there is a re-PUT before every task. The other
+  providers still keep their key in the Linux keyring and lose it on restart.
+- seccomp=unconfined is required because the providers that still read the
+  Linux keyutils keyring call keyctl/add_key, and GET /llm/catalog asks every
+  provider for its models. Without it those calls fail with "failed to
+  initialize Linux Keyutils".
 - --cpu: translation must use a remote provider (llama.cpp is not
   initialized); inpainting uses the Torch-backed LaMa model; rendered PNG
   export needs a GPU while source export works. On first run the CPU LibTorch
@@ -156,9 +163,11 @@ builder.
 - In --gpu mode the working OCR/translation combo is baberu-ocr plus a remote
   translation provider: local GGUF translation is unavailable because --gpu
   skips llama.cpp, and paddleocr-vl-1.6 also depends on llama.cpp.
-- Provider secrets live in the Linux keyutils session keyring
-  (PUT /config/providers/{id}/secret). They do not survive a container
-  restart, so re-PUT after every restart; the config file itself persists.
+- deepseek and openai-compatible credentials arrive with
+  PUT /config/providers/{id}/secret and live only in server memory until the
+  task that consumes them ends, then they are dropped. Send the key before
+  every task. The other providers keep their key in the Linux keyutils session
+  keyring and lose it on a container restart.
 - PATCH /config merges sparsely at the top level only: each section present
   in the request replaces the stored section wholesale (PipelineConfig falls
   back to serde defaults for missing fields), so always send the complete
@@ -169,3 +178,35 @@ builder.
   single-page through-ocr run (detection + baberu-ocr) commits SourceText to
   the scene, and through-translation commits a remote-provider Translation;
   each takes well under a minute per page on this CPU.
+
+## Shared host deployment (lab PC with an RTX 5070 Ti)
+
+Notes for running the headless server on a machine several people use. The
+point of this section is that no one's translation key ends up stored on the
+box.
+
+- Hardware and start command. The GPU needs a driver at least as new as the
+  CUDA 13.3 runtime the build bundles (see MIN_DRIVER_VERSION in
+  crates/koharu-runtime/src/hardware/cuda.rs). Start with --gpu. Note that the
+  runtime image installs Mesa ANV for the Intel iGPU path; what an NVIDIA
+  discrete GPU additionally needs inside the container (NVIDIA Container
+  Toolkit, the CUDA runtime libraries) is not covered by this Dockerfile yet
+  and has not been verified.
+- Credentials. Configure the caller to use deepseek or openai-compatible and
+  have it send the key with
+  `PUT /api/v1/config/providers/{translation_provider}/secret` before every
+  task. The server holds it in memory for that one task and drops it when the
+  task reaches Completed, Cancelled, or Failed. The key is never written to
+  disk, never enters ~/.koharu/config.toml, and never enters the OS credential
+  service. `DELETE` on the same path clears a staged key early; a key that is
+  staged and never claimed is dropped after ten minutes. Using any other
+  provider restores the old behaviour and stores its key in the keyring, so do
+  not configure one of those on a shared machine.
+- Network exposure. The server has no authentication layer and no per-user
+  isolation: it binds the given host and port and answers any caller
+  (CorsLayer::very_permissive in crates/koharu-rpc/src/api.rs). Bind it to a
+  private interface or put an authenticating reverse proxy in front of it. Do
+  not expose it directly to a shared or public network.
+- Telemetry. Build the image without SENTRY_DSN. The DSN is a compile-time
+  variable; without it the Sentry client is disabled. send_default_pii is off
+  either way.

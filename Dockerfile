@@ -9,8 +9,11 @@
 #     -v koharu-data:/home/koharu/.local/share/Koharu \
 #     koharu-headless
 #
-# seccomp=unconfined is required because koharu-secrets stores provider API
-# keys in the Linux keyutils keyring (keyctl/add_key syscalls). The image does
+# seccomp=unconfined is required because the providers that still read their
+# API key from the Linux keyutils keyring call keyctl/add_key syscalls, and
+# GET /llm/catalog reaches every provider. The deepseek and openai-compatible
+# keys never touch the keyring: they arrive with the request and are dropped
+# when the task ends. The image does
 # NOT embed LibTorch or the llama.cpp / stable-diffusion.cpp binaries. The
 # headless server calls Store::configure(data_dir/packages) in
 # crates/koharu-rpc/src/server.rs, so the packages are downloaded on the

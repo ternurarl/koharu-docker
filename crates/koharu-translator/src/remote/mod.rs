@@ -30,8 +30,8 @@ pub use openai_compatible::OpenAiCompatibleConfig;
 pub use openrouter::OpenRouterConfig;
 
 use crate::{
-    Error, GenerationConfig, Model, ModelSelection, Provider, ProvidersConfig, Result,
-    TranslationRequest,
+    Error, GenerationConfig, Model, ModelSelection, Provider, ProviderSecrets, ProvidersConfig,
+    Result, TranslationRequest,
 };
 
 pub(crate) async fn translate(
@@ -40,6 +40,7 @@ pub(crate) async fn translate(
     selection: &ModelSelection,
     generation: &GenerationConfig,
     request: &TranslationRequest,
+    secrets: &ProviderSecrets,
 ) -> Result<Vec<String>> {
     let model = || {
         selection
@@ -64,7 +65,8 @@ pub(crate) async fn translate(
             minimax::translate(client, &providers.minimax, model()?, generation, request).await
         }
         Provider::DeepSeek => {
-            deepseek::translate(client, &providers.deepseek, model()?, generation, request).await
+            deepseek::translate(client, &providers.deepseek, model()?, generation, request, secrets)
+                .await
         }
         Provider::OpenAiCompatible => {
             openai_compatible::translate(
@@ -73,6 +75,7 @@ pub(crate) async fn translate(
                 model()?,
                 generation,
                 request,
+                secrets,
             )
             .await
         }
@@ -92,7 +95,11 @@ pub(crate) async fn translate(
     }
 }
 
-pub(crate) async fn models(client: &Client, providers: &ProvidersConfig) -> Vec<Model> {
+pub(crate) async fn models(
+    client: &Client,
+    providers: &ProvidersConfig,
+    secrets: &ProviderSecrets,
+) -> Vec<Model> {
     let mut models = Vec::new();
     let pending: Vec<BoxFuture<'_, Result<Vec<Model>>>> = vec![
         openai::models(client).boxed(),
@@ -100,8 +107,8 @@ pub(crate) async fn models(client: &Client, providers: &ProvidersConfig) -> Vec<
         claude::models(client).boxed(),
         grok::models(client).boxed(),
         minimax::models(client).boxed(),
-        deepseek::models(client).boxed(),
-        openai_compatible::models(client, &providers.openai_compatible).boxed(),
+        deepseek::models(client, secrets).boxed(),
+        openai_compatible::models(client, &providers.openai_compatible, secrets).boxed(),
         openrouter::models(client).boxed(),
         lm_studio::models(client, &providers.lm_studio).boxed(),
         deepl::models().boxed(),
@@ -132,15 +139,18 @@ pub(super) async fn send_json<T: DeserializeOwned>(
     provider: &'static str,
     request: RequestBuilder,
 ) -> Result<T> {
-    let response = request
-        .send()
-        .await
-        .with_context(|| format!("{provider} request failed"))?;
+    // `without_url` keeps the request URL out of the error text. Some providers
+    // carry the API key in the query string, and `reqwest` prints the whole URL
+    // in its `Display`.
+    let response = request.send().await.map_err(|error| Error::Transport {
+        provider,
+        reason: error.without_url().to_string(),
+    })?;
     let status = response.status();
-    let text = response
-        .text()
-        .await
-        .with_context(|| format!("failed to read {provider} response"))?;
+    let text = response.text().await.map_err(|error| Error::Transport {
+        provider,
+        reason: error.without_url().to_string(),
+    })?;
 
     if !status.is_success() {
         let lower = text.to_ascii_lowercase();

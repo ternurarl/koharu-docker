@@ -27,6 +27,7 @@ koharu-scene = { workspace = true }
 koharu-translator = { workspace = true }
 rayon = { workspace = true }
 revision = { workspace = true }
+secrecy = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 specta = { workspace = true }

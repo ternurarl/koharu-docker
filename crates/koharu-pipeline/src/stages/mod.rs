@@ -22,6 +22,7 @@ pub(crate) struct StageInput {
     region: Option<Bounds>,
     images: Arc<ImageCache>,
     inpainting_mask: Option<InpaintingMask>,
+    secrets: koharu_translator::ProviderSecrets,
 }
 
 impl StageInput {
@@ -32,6 +33,7 @@ impl StageInput {
         region: Option<Bounds>,
         images: Arc<ImageCache>,
         inpainting_mask: Option<InpaintingMask>,
+        secrets: koharu_translator::ProviderSecrets,
     ) -> Self {
         Self {
             scene,
@@ -40,6 +42,7 @@ impl StageInput {
             region,
             images,
             inpainting_mask,
+            secrets,
         }
     }
 

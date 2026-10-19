@@ -151,8 +151,9 @@ koharu --headless [--host <addr>] [--port <port>] [--data <dir>] [--cpu | --gpu]
 
 ### 密钥
 
-- `PUT /api/v1/config/providers/{id}/secret`，body `{"secret": "<key>"}` → `204`
-- 密钥存于 Linux keyring，容器重启后丢失——每次重启后需重新 PUT。
+- `PUT /api/v1/config/providers/{id}/secret`，body `{"secret": "<key>"}` → `204`；`DELETE` 同一路径显式清除。
+- `deepseek` 与 `openai-compatible` 的密钥只暂存在服务进程内存里，任务结束（完成、失败、取消都算）即删除，不写磁盘、不进 OS keyring。因此**每次翻译前都要重新 PUT**，没有「重启后重放」这回事。
+- 其余 provider 的密钥存于 Linux keyring，容器重启后丢失——每次重启后需重新 PUT。
 
 ### 翻译模型捷径
 

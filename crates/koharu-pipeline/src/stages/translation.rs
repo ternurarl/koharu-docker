@@ -68,7 +68,12 @@ impl StageProcessor for Processor {
         }
         let (provider, translated) = self
             .translator
-            .translate(&self.config.model, self.config.generation, request)
+            .translate(
+                &self.config.model,
+                self.config.generation,
+                request,
+                &input.secrets,
+            )
             .await?;
         let language = LanguageTag::new(self.config.target_language.tag())?;
         let generated = generation(PRODUCER, provider)?;

@@ -4,14 +4,13 @@
 // https://api-docs.deepseek.com/guides/thinking_mode
 
 use anyhow::Context;
-use koharu_secrets::ExposeSecret;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
 use super::send_json;
 use crate::{
-    GenerationConfig, Model, Provider, Result, TranslationRequest, backend::encode_image,
-    display_name, prompt,
+    GenerationConfig, Model, Provider, ProviderSecrets, Result, TranslationRequest,
+    backend::encode_image, display_name, prompt,
 };
 
 const URL: &str = "https://api.deepseek.com/chat/completions";
@@ -21,15 +20,12 @@ const MODELS_URL: &str = "https://api.deepseek.com/models";
 #[serde(default)]
 pub struct DeepSeekConfig {}
 
-pub(super) async fn models(client: &Client) -> Result<Vec<Model>> {
-    let Some(api_key) = koharu_secrets::get("deepseek")? else {
+pub(super) async fn models(client: &Client, secrets: &ProviderSecrets) -> Result<Vec<Model>> {
+    let Some(api_key) = secrets.get(Provider::DeepSeek) else {
         return Ok(Vec::new());
     };
-    let response: ModelsResponse = send_json(
-        "deepseek",
-        client.get(MODELS_URL).bearer_auth(api_key.expose_secret()),
-    )
-    .await?;
+    let response: ModelsResponse =
+        send_json("deepseek", client.get(MODELS_URL).bearer_auth(api_key)).await?;
     Ok(response
         .data
         .into_iter()
@@ -50,8 +46,11 @@ pub(super) async fn translate(
     model: &str,
     generation: &GenerationConfig,
     request: &TranslationRequest,
+    secrets: &ProviderSecrets,
 ) -> Result<Vec<String>> {
-    let api_key = koharu_secrets::get("deepseek")?.context("deepseek API key is not configured")?;
+    let api_key = secrets
+        .get(Provider::DeepSeek)
+        .context("deepseek API key is not configured")?;
     let (system, user) = prompt::prompts(request)?;
     let user_content = match request.image.as_deref() {
         Some(image) => MessageContent::Parts(vec![
@@ -88,7 +87,7 @@ pub(super) async fn translate(
         "deepseek",
         client
             .post(URL)
-            .bearer_auth(api_key.expose_secret())
+            .bearer_auth(api_key)
             .json(&body),
     )
     .await?;

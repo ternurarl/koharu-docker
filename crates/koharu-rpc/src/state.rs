@@ -15,8 +15,10 @@ use std::{
 
 use koharu_pipeline::StopToken;
 use koharu_scene::EntityId;
+use koharu_translator::{Provider, ProviderSecrets};
 use parking_lot::Mutex;
 use serde::Serialize;
+use std::time::{Duration, Instant};
 
 use crate::project::{Project, ProjectLibrary};
 
@@ -61,6 +63,79 @@ impl EventBus {
     }
 }
 
+/// How long a staged credential may sit unused before it is dropped.
+///
+/// This is a backstop for a caller that sent a key and then never started a
+/// task, such as a client that failed while creating its project. It is not
+/// the way a task's credentials are destroyed: those leave with the task.
+const STAGED_SECRET_TTL: Duration = Duration::from_secs(10 * 60);
+
+/// Credentials a caller staged with `PUT /api/v1/config/providers/{id}/secret`.
+///
+/// Memory only: nothing here is written to disk and nothing here reaches the
+/// OS credential service. A task takes what is staged and holds it for its own
+/// lifetime. `staged_at` records when the newest key arrived, so a task that
+/// has just finished can drop the generation it was given without touching keys
+/// a later caller has already staged for its own task.
+pub struct StagedSecrets {
+    secrets: ProviderSecrets,
+    staged_at: Option<Instant>,
+}
+
+impl Default for StagedSecrets {
+    fn default() -> Self {
+        Self {
+            secrets: ProviderSecrets::default(),
+            staged_at: None,
+        }
+    }
+}
+
+impl StagedSecrets {
+    pub fn insert(&mut self, provider: Provider, value: String) {
+        self.secrets.insert(provider, value);
+        self.staged_at = Some(Instant::now());
+    }
+
+    pub fn remove(&mut self, provider: Provider) {
+        self.secrets.remove(provider);
+    }
+
+    /// Hands the staged credentials to a task and empties the staging area, so
+    /// the running task holds the only copy.
+    pub fn take(&mut self) -> ProviderSecrets {
+        self.staged_at = None;
+        std::mem::take(&mut self.secrets)
+    }
+
+    /// A copy of what is staged, for callers that only need to read, such as
+    /// the model catalog.
+    pub fn staged(&self) -> ProviderSecrets {
+        self.secrets.clone()
+    }
+
+    /// Drops credentials staged at or before `cutoff`. A finishing task passes
+    /// the moment it started: everything staged since then belongs to a later
+    /// caller and stays.
+    pub fn forget_staged_at_or_before(&mut self, cutoff: Instant) {
+        if self.staged_at.is_some_and(|staged| staged <= cutoff) {
+            self.secrets = ProviderSecrets::default();
+            self.staged_at = None;
+        }
+    }
+
+    /// Drops credentials that no task ever claimed.
+    pub fn expire(&mut self) {
+        if self
+            .staged_at
+            .is_some_and(|staged| staged.elapsed() > STAGED_SECRET_TTL)
+        {
+            self.secrets = ProviderSecrets::default();
+            self.staged_at = None;
+        }
+    }
+}
+
 /// Server-wide state shared behind an Arc.
 pub struct App {
     pub version: String,
@@ -71,6 +146,8 @@ pub struct App {
     pub library: ProjectLibrary,
     pub jobs: Mutex<HashMap<String, JobSummary>>,
     pub cancels: Mutex<HashMap<String, StopToken>>,
+    /// Credentials waiting for the next task. See [`StagedSecrets`].
+    pub secrets: Mutex<StagedSecrets>,
     pub bus: EventBus,
     pub data_dir: PathBuf,
 }
@@ -91,6 +168,7 @@ impl App {
             library,
             jobs: Mutex::new(HashMap::new()),
             cancels: Mutex::new(HashMap::new()),
+            secrets: Mutex::new(StagedSecrets::default()),
             bus: EventBus::new(),
             data_dir,
         }))

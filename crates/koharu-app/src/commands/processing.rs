@@ -130,6 +130,7 @@ pub(crate) async fn process(
             stop: stop.clone(),
             progress: None,
             inpainting_mask,
+            secrets: super::preferences::task_secrets()?,
         };
         request.progress = Some(Arc::new(move |event| {
             let update = match event {

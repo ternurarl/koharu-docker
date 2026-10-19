@@ -24,6 +24,13 @@ pub enum Error {
     },
     #[error("{provider} quota or rate limit was exceeded")]
     QuotaExceeded { provider: &'static str },
+    /// A transport failure whose text has been stripped of the request URL:
+    /// some providers carry the API key in the query string.
+    #[error("{provider} request failed: {reason}")]
+    Transport {
+        provider: &'static str,
+        reason: String,
+    },
     #[error("{provider} API request failed with HTTP {status}: {message}")]
     Api {
         provider: &'static str,

@@ -32,12 +32,18 @@ impl ApiError {
         Self::new(StatusCode::NOT_FOUND, message)
     }
 
+    /// A failure whose details belong in the server log, not in the response.
+    ///
+    /// The anyhow chain can carry a request URL or an upstream body, so the
+    /// client gets the outermost message and the rest is logged.
     pub fn service_unavailable(error: anyhow::Error) -> Self {
-        Self::new(StatusCode::SERVICE_UNAVAILABLE, format!("{error:#}"))
+        tracing::error!("request could not be served: {error:#}");
+        Self::new(StatusCode::SERVICE_UNAVAILABLE, error.to_string())
     }
 
     pub fn internal(error: anyhow::Error) -> Self {
-        Self::new(StatusCode::INTERNAL_SERVER_ERROR, format!("{error:#}"))
+        tracing::error!("request failed: {error:#}");
+        Self::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
     }
 }
 

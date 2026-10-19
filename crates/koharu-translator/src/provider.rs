@@ -114,6 +114,20 @@ macro_rules! define_providers {
     };
 }
 
+impl Provider {
+    /// Whether the caller supplies this provider's credential with the task
+    /// instead of storing it in the OS credential service.
+    ///
+    /// `deepseek` and `openai-compatible` are the two providers a shared host
+    /// accepts credentials for: the key arrives with the request, lives for one
+    /// task, and is never written to disk. The other providers keep reading the
+    /// OS credential service, so their keys are stored there as before.
+    #[must_use]
+    pub const fn takes_task_secret(self) -> bool {
+        matches!(self, Self::DeepSeek | Self::OpenAiCompatible)
+    }
+}
+
 define_providers! {
     Local {
         id: "local",

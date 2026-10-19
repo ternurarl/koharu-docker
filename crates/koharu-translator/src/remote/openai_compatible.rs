@@ -1,15 +1,14 @@
 // https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create
 
 use anyhow::Context;
-use koharu_secrets::ExposeSecret;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
 use super::send_json;
 use crate::{
-    GenerationConfig, Model, Provider, Result, TranslationRequest, backend::encode_image,
-    display_name, prompt,
+    GenerationConfig, Model, Provider, ProviderSecrets, Result, TranslationRequest,
+    backend::encode_image, display_name, prompt,
 };
 
 const DEFAULT_BASE_URL: &str = "http://localhost:11434/v1";
@@ -36,8 +35,9 @@ pub(super) async fn translate(
     model: &str,
     generation: &GenerationConfig,
     request: &TranslationRequest,
+    secrets: &ProviderSecrets,
 ) -> Result<Vec<String>> {
-    let api_key = koharu_secrets::get("openai-compatible")?;
+    let api_key = secrets.get(Provider::OpenAiCompatible);
     let (system, user) = prompt::prompts(request)?;
     let user_content = match request.image.as_deref() {
         Some(image) => MessageContent::Parts(vec![
@@ -86,7 +86,7 @@ pub(super) async fn translate(
         .post(endpoint(config.base_url.as_ref(), "chat/completions"))
         .json(&body);
     let http = match api_key {
-        Some(api_key) => http.bearer_auth(api_key.expose_secret()),
+        Some(api_key) => http.bearer_auth(api_key),
         None => http,
     };
     let response: ChatResponse = send_json("openai-compatible", http).await?;
@@ -105,11 +105,15 @@ pub(super) async fn translate(
     )?)
 }
 
-pub(super) async fn models(client: &Client, config: &OpenAiCompatibleConfig) -> Result<Vec<Model>> {
-    let api_key = koharu_secrets::get("openai-compatible")?;
+pub(super) async fn models(
+    client: &Client,
+    config: &OpenAiCompatibleConfig,
+    secrets: &ProviderSecrets,
+) -> Result<Vec<Model>> {
+    let api_key = secrets.get(Provider::OpenAiCompatible);
     let request = client.get(endpoint(config.base_url.as_ref(), "models"));
     let request = match api_key {
-        Some(api_key) => request.bearer_auth(api_key.expose_secret()),
+        Some(api_key) => request.bearer_auth(api_key),
         None => request,
     };
     let response: ModelsResponse = send_json("openai-compatible", request).await?;

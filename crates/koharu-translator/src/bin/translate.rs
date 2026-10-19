@@ -5,12 +5,12 @@ use clap::Parser;
 use koharu_config::Config;
 use koharu_secrets::{ExposeSecret, SecretString};
 use koharu_translator::{
-    GenerationConfig, Language, ModelSelection, Provider, ProvidersConfig, TranslationRequest,
-    Translator,
+    GenerationConfig, Language, ModelSelection, Provider, ProviderSecrets, ProvidersConfig,
+    TranslationRequest, Translator,
 };
 use url::Url;
 
-#[derive(Debug, Parser)]
+#[derive(Parser)]
 #[command(about = "Run Koharu's configured translator")]
 struct Args {
     #[arg(long)]
@@ -51,7 +51,7 @@ async fn main() -> Result<()> {
     if provider == Provider::Local {
         koharu_ml::init().await?;
     }
-    prepare_secret(&args, provider)?;
+    let secrets = credentials(&args, provider)?;
 
     let mut providers = ProvidersConfig::default();
     if let Some(base_url) = args.base_url.clone() {
@@ -91,7 +91,7 @@ async fn main() -> Result<()> {
         request = request.with_instructions(instructions);
     }
     let (_, translated) = translator
-        .translate(&selection, GenerationConfig::default(), request)
+        .translate(&selection, GenerationConfig::default(), request, &secrets)
         .await?;
 
     if args.json {
@@ -104,8 +104,15 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn prepare_secret(args: &Args, provider: Provider) -> Result<()> {
+/// Collects the API key for this one CLI run.
+///
+/// The key is handed to the translator in memory and goes away with the
+/// process. Providers that still read the OS credential service also need it
+/// stored there, so those keep the write; `deepseek` and `openai-compatible`
+/// take the key from `secrets` and never reach the credential service.
+fn credentials(args: &Args, provider: Provider) -> Result<ProviderSecrets> {
     let provider_id: &'static str = provider.into();
+    let mut secrets = ProviderSecrets::default();
     let Some((variable, required)) = (match provider {
         Provider::Local => None,
         Provider::OpenAi => Some(("OPENAI_API_KEY", true)),
@@ -121,7 +128,7 @@ fn prepare_secret(args: &Args, provider: Provider) -> Result<()> {
         Provider::GoogleCloudTranslation => Some(("GOOGLE_CLOUD_API_KEY", true)),
         Provider::Caiyun => Some(("CAIYUN_API_KEY", true)),
     }) else {
-        return Ok(());
+        return Ok(secrets);
     };
     let value = args
         .api_key
@@ -129,12 +136,20 @@ fn prepare_secret(args: &Args, provider: Provider) -> Result<()> {
         .filter(|key| !key.trim().is_empty())
         .or_else(|| env::var(variable).ok().filter(|key| !key.trim().is_empty()));
     if let Some(value) = value {
-        koharu_secrets::set(provider_id, &SecretString::from(value))?;
-    } else if required
-        && koharu_secrets::get(provider_id)?
+        if provider.takes_task_secret() {
+            secrets.insert(provider, value);
+        } else {
+            koharu_secrets::set(provider_id, &SecretString::from(value))?;
+        }
+    } else if required {
+        if provider.takes_task_secret() {
+            anyhow::bail!("--api-key or {variable} is required");
+        }
+        if koharu_secrets::get(provider_id)?
             .is_none_or(|value| value.expose_secret().trim().is_empty())
-    {
-        anyhow::bail!("--api-key, {variable}, or a stored API key is required");
+        {
+            anyhow::bail!("--api-key, {variable}, or a stored API key is required");
+        }
     }
-    Ok(())
+    Ok(secrets)
 }

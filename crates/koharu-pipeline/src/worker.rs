@@ -17,6 +17,7 @@ use std::{
 use anyhow::{Context as _, Result, anyhow, bail};
 use koharu_scene::{Patch, PatchTransfer, Revision, Snapshot};
 use revision::{DeserializeRevisioned, SerializeRevisioned};
+use secrecy::zeroize::Zeroize;
 use tokio::{
     io::{AsyncReadExt as _, AsyncWriteExt as _},
     process::Command,
@@ -76,7 +77,12 @@ pub(crate) async fn execute(
         .write_all(&input)
         .await
         .context("failed to send the task assignment")?;
-    input.clear();
+    // The frame carries the task credentials in plaintext. `clear` only sets
+    // the length to zero and leaves the bytes in the allocation, so wipe them
+    // before the buffer goes away, and drop the decoded assignment now rather
+    // than at the end of the call.
+    input.zeroize();
+    drop(assignment);
     // The cancel byte rides the same stdin as the assignment. The child reads
     // the assignment by its length prefix first, so the byte never lands
     // inside a frame.
@@ -188,8 +194,12 @@ async fn export_scene(snapshot: &Snapshot, directory: &Path) -> Result<()> {
 /// committed patch.
 pub async fn run(project: PathBuf) -> Result<()> {
     let mut stdin = tokio::io::stdin();
-    let assignment = decode::<WorkerAssignment>(&read_assignment(&mut stdin).await?)
-        .context("pipeline task assignment is not readable")?;
+    let mut frame = read_assignment(&mut stdin).await?;
+    let decoded = decode::<WorkerAssignment>(&frame);
+    // The frame is the whole assignment in plaintext, credentials included.
+    // `Vec<u8>` does not zero its allocation on drop.
+    frame.zeroize();
+    let assignment = decoded.context("pipeline task assignment is not readable")?;
     drop(stdin);
     let mut stdout = tokio::io::stdout();
     let stop = StopToken::default();
@@ -304,7 +314,7 @@ impl WorkerCommitter<'_> {
     }
 }
 
-#[revision::revisioned(revision = 1)]
+#[revision::revisioned(revision = 2)]
 #[derive(Clone)]
 struct WorkerAssignment {
     operation: String,
@@ -319,6 +329,11 @@ struct WorkerAssignment {
     /// child falls back to the default cache directory and installs its own
     /// copy of Torch, stable-diffusion.cpp, and the model packages.
     store: String,
+    /// The provider credentials this task may use. The scratch project the
+    /// parent exports holds only scene data, so the assignment frame is the
+    /// only place the keys cross the process boundary.
+    #[revision(start = 2)]
+    secrets: koharu_translator::ProviderSecrets,
 }
 
 /// Which ML runtimes the parent initialized, so the child initializes the same
@@ -371,6 +386,7 @@ impl WorkerAssignment {
             base,
             runtime: WorkerRuntime::current(),
             store: koharu_runtime::Store::root().display().to_string(),
+            secrets: request.secrets,
         })
     }
 
@@ -384,6 +400,7 @@ impl WorkerAssignment {
                 page: mask.page,
                 png: Arc::from(mask.png),
             }),
+            secrets: self.secrets,
         })
     }
 }
@@ -663,11 +680,12 @@ fn model_releases(releases: &[WorkerModelRelease]) -> Result<Vec<(Stage, bool)>>
 }
 
 fn encode<T: SerializeRevisioned>(value: &T) -> Result<Vec<u8>> {
-    let body = revision::to_vec(value)?;
+    let mut body = revision::to_vec(value)?;
     let mut frame = Vec::with_capacity(4 + body.len());
     let length = u32::try_from(body.len()).context("frame exceeds 4 GiB")?;
     frame.extend_from_slice(&length.to_le_bytes());
     frame.extend_from_slice(&body);
+    body.zeroize();
     Ok(frame)
 }
 

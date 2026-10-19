@@ -86,8 +86,9 @@ async fn delete_current_llm(State(_app): State<AppState>) -> ApiResult<StatusCod
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn get_catalog(State(_app): State<AppState>) -> ApiResult<Json<LlmCatalog>> {
-    let models = koharu_translator::Translator::models()
+async fn get_catalog(State(app): State<AppState>) -> ApiResult<Json<LlmCatalog>> {
+    let secrets = app.secrets.lock().staged();
+    let models = koharu_translator::Translator::models(&secrets)
         .await
         .map_err(ApiError::internal)?;
     Ok(Json(LlmCatalog { models }))

@@ -949,6 +949,7 @@ mod tests {
                 page,
                 png: encode(&DynamicImage::ImageLuma8(transient)),
             }),
+            koharu_translator::ProviderSecrets::default(),
         );
 
         let prepared = prepare(&input).await.unwrap();
@@ -1003,6 +1004,7 @@ mod tests {
             None,
             Arc::new(crate::ImageCache::default()),
             None,
+            koharu_translator::ProviderSecrets::default(),
         );
         let manual = StageInput::new(
             snapshot,
@@ -1014,6 +1016,7 @@ mod tests {
                 page,
                 png: Arc::<[u8]>::from([]),
             }),
+            koharu_translator::ProviderSecrets::default(),
         );
         let processor = Processor::new(InpaintingModel::LaMa {}, koharu_ml::Device::cpu()).unwrap();
 

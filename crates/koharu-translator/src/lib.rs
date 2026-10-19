@@ -8,6 +8,7 @@ mod model;
 mod prompt;
 mod provider;
 mod remote;
+mod secret;
 
 use std::{sync::Arc, time::Duration};
 
@@ -21,6 +22,7 @@ pub use language::Language;
 pub use model::{GenerationConfig, Model, ModelSelection, Quantization};
 pub(crate) use model::{ModelGeneration, QuantizationDefinition, display_name};
 pub use provider::{Provider, ProviderConfig, ProvidersConfig};
+pub use secret::ProviderSecrets;
 
 #[derive(Clone)]
 pub struct Translator {
@@ -105,6 +107,7 @@ impl Translator {
         selection: &ModelSelection,
         generation: GenerationConfig,
         mut request: TranslationRequest,
+        secrets: &ProviderSecrets,
     ) -> anyhow::Result<(&'static str, Vec<String>)> {
         let provider = selection.provider;
         let provider_id: &'static str = provider.into();
@@ -128,7 +131,15 @@ impl Translator {
                 .await?
         } else {
             let providers = self.providers.read()?.clone();
-            remote::translate(&self.client, &providers, selection, &generation, &request).await?
+            remote::translate(
+                &self.client,
+                &providers,
+                selection,
+                &generation,
+                &request,
+                secrets,
+            )
+            .await?
         };
         if translated.len() != expected {
             return Err(Error::SegmentCount {
@@ -142,7 +153,7 @@ impl Translator {
     }
 
     #[tracing::instrument(skip_all)]
-    pub async fn models() -> anyhow::Result<Vec<Model>> {
+    pub async fn models(secrets: &ProviderSecrets) -> anyhow::Result<Vec<Model>> {
         static CLIENT: tokio::sync::OnceCell<reqwest::Client> = tokio::sync::OnceCell::const_new();
 
         let providers = ProvidersConfig::load()?;
@@ -155,7 +166,7 @@ impl Translator {
             })
             .await?;
         let mut models = local::models();
-        models.extend(remote::models(client, &providers).await);
+        models.extend(remote::models(client, &providers, secrets).await);
         Ok(models)
     }
 

@@ -4,9 +4,12 @@ use anyhow::Result;
 use koharu_pipeline::PipelineConfig;
 use koharu_renderer::TypesettingConfig;
 use koharu_secrets::ExposeSecret as _;
-use koharu_translator::{Language, Model, Provider, ProviderConfig, ProvidersConfig};
+use koharu_translator::{
+    Language, Model, Provider, ProviderConfig, ProviderSecrets, ProvidersConfig,
+};
 use serde::{Deserialize, Serialize};
 use specta::Type;
+use strum::VariantArray as _;
 
 use super::Error;
 
@@ -195,8 +198,30 @@ pub(crate) async fn get_preferences() -> std::result::Result<Preferences, Error>
     Ok(Preferences::load()?)
 }
 
+/// Reads the stored translation credentials into the set one task carries.
+///
+/// The desktop keeps provider keys in the OS credential service, which is the
+/// right home on a machine only one person uses. The pipeline still receives a
+/// copy that lives for exactly one task: nothing in the translation path writes
+/// a key back, so the stored form belongs to the preferences layer alone.
+pub(crate) fn task_secrets() -> Result<ProviderSecrets> {
+    let mut secrets = ProviderSecrets::default();
+    for provider in Provider::VARIANTS {
+        if provider == Provider::Local || !provider.takes_task_secret() {
+            continue;
+        }
+        let key: &'static str = provider.into();
+        if let Some(value) = koharu_secrets::get(key)?
+            && !value.expose_secret().trim().is_empty()
+        {
+            secrets.insert(provider, value.expose_secret().to_owned());
+        }
+    }
+    Ok(secrets)
+}
+
 #[tauri::command]
 #[specta::specta]
 pub(crate) async fn get_translation_models() -> std::result::Result<Vec<Model>, Error> {
-    Ok(koharu_translator::Translator::models().await?)
+    Ok(koharu_translator::Translator::models(&task_secrets()?).await?)
 }

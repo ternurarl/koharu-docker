@@ -162,6 +162,7 @@ impl KoharuHost {
             stop,
             progress: None,
             inpainting_mask: None,
+            secrets: crate::commands::preferences::task_secrets()?,
         };
         let task = self
             .handle

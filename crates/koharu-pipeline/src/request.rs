@@ -11,6 +11,7 @@ use specta::Type;
 
 use crate::{ProgressSink, Scope, Stage};
 use koharu_scene::EntityId;
+use koharu_translator::ProviderSecrets;
 
 #[derive(Clone, Debug)]
 pub struct InpaintingMask {
@@ -70,6 +71,10 @@ pub struct Request {
     pub stop: StopToken,
     pub progress: Option<ProgressSink>,
     pub inpainting_mask: Option<InpaintingMask>,
+    /// The provider credentials this one task may use. They arrive with the
+    /// request, travel into the task subprocess, and go away when the task
+    /// stops; nothing in the pipeline writes them to disk.
+    pub secrets: ProviderSecrets,
 }
 
 impl Default for Request {
@@ -80,6 +85,7 @@ impl Default for Request {
             stop: StopToken::default(),
             progress: None,
             inpainting_mask: None,
+            secrets: ProviderSecrets::default(),
         }
     }
 }

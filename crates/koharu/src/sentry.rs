@@ -7,7 +7,10 @@ pub fn initialize() -> sentry::ClientInitGuard {
             .into_dsn()
             .expect("invalid SENTRY_DSN environment variable"),
         release: sentry::release_name!(),
-        send_default_pii: true,
+        // Never ship request payloads, URLs, or breadcrumbs: a translation
+        // error can name a provider endpoint, and a shared host must not hand
+        // that to a third party. Build public images without SENTRY_DSN at all.
+        send_default_pii: false,
         sample_rate: 0.1,
         auto_session_tracking: true,
         ..Default::default()

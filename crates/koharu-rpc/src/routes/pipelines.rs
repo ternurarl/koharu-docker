@@ -4,6 +4,7 @@
 //! the /events SSE stream. Cancellation goes to DELETE /operations/{id}.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::Context as _;
 use axum::{Json, Router, extract::State, routing::post};
@@ -50,6 +51,11 @@ async fn start_pipeline(
     };
 
     let operation_id = Uuid::new_v4().to_string();
+    // The task takes the staged credentials and holds them for its own
+    // lifetime. `started_at` marks that generation so the task can drop what it
+    // was given without touching a key a later caller has already staged.
+    let started_at = Instant::now();
+    let secrets = app.secrets.lock().take();
     let stop = StopToken::default();
     app.cancels
         .lock()
@@ -135,6 +141,7 @@ async fn start_pipeline(
                 }));
             })),
             inpainting_mask: None,
+            secrets,
         };
 
         struct SessionCommitter {
@@ -173,10 +180,16 @@ async fn start_pipeline(
             Ok(_) => (JobStatus::Completed, None),
             Err(error) => {
                 tracing::error!(operation_id = %op_id_c, "pipeline run failed: {error:#}");
-                (JobStatus::Failed, Some(format!("{error:#}")))
+                // The response and the job record carry the outermost message
+                // only; the full chain stays in the server log.
+                (JobStatus::Failed, Some(error.to_string()))
             }
         };
 
+        app_c
+            .secrets
+            .lock()
+            .forget_staged_at_or_before(started_at);
         app_c.cancels.lock().remove(&op_id_c);
         if let Some(job) = app_c.jobs.lock().get_mut(&op_id_c) {
             job.status = status;

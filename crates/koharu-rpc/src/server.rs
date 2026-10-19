@@ -2,6 +2,7 @@
 //! attaches the router to a TCP listener.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::{Context as _, Result};
 
@@ -51,6 +52,18 @@ pub async fn serve(host: &str, port: u16, data: Option<PathBuf>, cpu: bool, gpu:
     );
 
     let app = App::new(device, data_dir)?;
+    // A caller that stages a credential and then never starts a task would
+    // otherwise leave it in memory for the life of the process.
+    {
+        let sweeper = app.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(60));
+            loop {
+                tick.tick().await;
+                sweeper.secrets.lock().expire();
+            }
+        });
+    }
     let listener = tokio::net::TcpListener::bind((host, port))
         .await
         .with_context(|| format!("failed to bind {host}:{port}"))?;
