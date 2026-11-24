@@ -10,8 +10,10 @@
 //! carries, so the path stays put until then.
 
 mod config;
+mod measure;
 mod model;
 mod processor;
+mod suppress;
 
 use anyhow::{Context, Result};
 use image::DynamicImage;
@@ -21,6 +23,7 @@ use crate::backend::TryIntoDevice;
 
 pub use self::{
     config::{KoharuLayoutRFDetrSeg2XLConfig, KoharuLayoutThresholds},
+    measure::glyph_mask,
     processor::{
         KoharuLayoutDetection, KoharuLayoutDetections, KoharuLayoutMask,
         KoharuLayoutRFDetrImageProcessor,
@@ -34,11 +37,27 @@ crate::model_repository!("mayocream/koharu-layout-highres" @ "68077eb09401a46e54
     WEIGHTS = "model.safetensors",
 });
 
+/// The lowest confidence an onomatopoeia detection keeps by default. The
+/// checkpoint recommends 0.3, but on 212 pages of Blue Archive's comics about
+/// two in five onomatopoeia scoring under 0.4 were drawn marks, such as anger
+/// veins, sweat drops, and motion lines, or lettering a text detection
+/// already covers. Upstream 4eefd2f0 measured this and overrides the
+/// checkpoint's value in `koharu_layout_highres/mod.rs`.
+pub const ONOMATOPOEIA_THRESHOLD: f32 = 0.4;
+
+/// The lowest confidence a bubble detection keeps by default. The checkpoint
+/// recommends 0.5, but on the same pages most bubbles scoring between 0.4 and
+/// 0.5 were plain speech bubbles, and inpainting fills only a detected
+/// bubble's text with its paper. Upstream e31c3e2d measured this and
+/// overrides the checkpoint's value in `koharu_layout_highres/mod.rs`.
+pub const BUBBLE_THRESHOLD: f32 = 0.4;
+
 #[derive(Debug)]
 pub struct KoharuLayoutRFDetrSeg2XL {
     device: Device,
     model: Model,
     processor: KoharuLayoutRFDetrImageProcessor,
+    thresholds: KoharuLayoutThresholds,
 }
 
 impl KoharuLayoutRFDetrSeg2XL {
@@ -60,6 +79,11 @@ impl KoharuLayoutRFDetrSeg2XL {
             model::RESOLUTION
         );
         let processor = KoharuLayoutRFDetrImageProcessor::new(&config)?;
+        let thresholds = KoharuLayoutThresholds {
+            onomatopoeia: ONOMATOPOEIA_THRESHOLD,
+            bubble: BUBBLE_THRESHOLD,
+            ..config.recommended_thresholds
+        };
         let mut model = Model::new(device);
         model
             .load(&weights_path)
@@ -68,28 +92,35 @@ impl KoharuLayoutRFDetrSeg2XL {
             device,
             model,
             processor,
+            thresholds,
         })
     }
 
     pub fn inference(&self, image: &DynamicImage) -> Result<KoharuLayoutDetections> {
-        self.inference_with_thresholds(image, self.processor.recommended_thresholds())
+        self.inference_with_thresholds(image, self.thresholds)
     }
 
+    /// The network's detections with the duplicates separate queries predict
+    /// removed, so each object is one detection.
     pub fn inference_with_thresholds(
         &self,
         image: &DynamicImage,
         thresholds: KoharuLayoutThresholds,
     ) -> Result<KoharuLayoutDetections> {
-        koharu_torch::no_grad(|| {
+        let mut detections = koharu_torch::no_grad(|| {
             let pixel_values = self.processor.preprocess(image, self.device)?;
             let output = self.model.forward(&pixel_values);
             self.processor
                 .postprocess(&output, image.width(), image.height(), thresholds)
-        })
+        })?;
+        suppress::suppress(&mut detections.detections);
+        Ok(detections)
     }
 
+    /// The default class thresholds: the checkpoint's recommended ones,
+    /// except for onomatopoeia and bubbles.
     pub fn recommended_thresholds(&self) -> KoharuLayoutThresholds {
-        self.processor.recommended_thresholds()
+        self.thresholds
     }
 }
 

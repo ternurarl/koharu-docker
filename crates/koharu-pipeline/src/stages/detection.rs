@@ -15,11 +15,10 @@ use imageproc::{
     contours::{BorderType, find_contours_with_threshold},
     distance_transform::{Norm, distance_transform},
     geometry::{approximate_polygon_dp, arc_length, contour_area},
-    morphology::{close, dilate},
 };
 use koharu_ml::koharu_layout_rfdetr_seg_2xl::{
     KoharuLayoutDetection, KoharuLayoutDetections, KoharuLayoutMask, KoharuLayoutRFDetrSeg2XL,
-    KoharuLayoutThresholds,
+    KoharuLayoutThresholds, glyph_mask,
 };
 use koharu_scene::{
     AssetInput, AssetMetadata, AssetRole, At, BubbleRegion, DetectionAnalysis, DetectionLabel,
@@ -33,6 +32,8 @@ use specta::Type;
 
 use super::{StageInput, StageProcessor, finish, generation};
 use crate::{DetectionModel, ModelCell};
+
+mod order;
 
 const MODEL_ID: &str = "mayocream/koharu-layout-highres";
 const MODEL_NAME: &str = "koharu-layout-rfdetr-seg-2xl";
@@ -53,6 +54,7 @@ const DIALOGUE_MASK_CONTAINMENT_THRESHOLD: f32 = 0.9;
 #[serde(default)]
 pub struct KoharuLayoutRFDetrSeg2XLConfig {
     pub text_threshold: Option<f32>,
+    pub onomatopoeia_threshold: Option<f32>,
     pub bubble_threshold: Option<f32>,
     pub panel_threshold: Option<f32>,
 }
@@ -68,6 +70,7 @@ impl Processor {
         let DetectionModel::KoharuLayoutRFDetrSeg2XL(settings) = &mut config;
         for (name, value) in [
             ("text", &mut settings.text_threshold),
+            ("onomatopoeia", &mut settings.onomatopoeia_threshold),
             ("bubble", &mut settings.bubble_threshold),
             ("panel", &mut settings.panel_threshold),
         ] {
@@ -149,6 +152,9 @@ impl Model {
         let network = KoharuLayoutRFDetrSeg2XL::load(device).await?;
         let mut thresholds = network.recommended_thresholds();
         thresholds.text = config.text_threshold.unwrap_or(thresholds.text);
+        thresholds.onomatopoeia = config
+            .onomatopoeia_threshold
+            .unwrap_or(thresholds.onomatopoeia);
         thresholds.bubble = config.bubble_threshold.unwrap_or(thresholds.bubble);
         thresholds.panel = config.panel_threshold.unwrap_or(thresholds.panel);
         Ok(Self {
@@ -279,7 +285,6 @@ async fn write_page(
     if let Some(region) = input.region {
         detections.retain(|detection| intersects(detection.bbox, region));
     }
-    non_maximum_suppression(&mut detections, 0.5);
     sort_by_layout(&mut detections);
 
     let image = image.to_rgb8();
@@ -287,7 +292,7 @@ async fn write_page(
         .context("failed to write detected regions")?;
     link_dialogue_regions(edit, &regions, generation)
         .context("failed to associate detected text with dialogue regions")?;
-    write_masks(input, edit, page, &detections, size)
+    write_masks(input, edit, page, &image, &detections, size)
         .await
         .context("failed to write detection masks")
 }
@@ -1358,14 +1363,35 @@ fn mask_geometry(mask: &KoharuLayoutMask) -> Option<Geometry> {
     })
 }
 
+/// The page's text mask: each text detection's mask fitted to its glyphs, so
+/// inpainting redraws the lettering and not the paper or art between it.
+/// Onomatopoeia keeps out of it, as a drawn mark of its own is redrawn with
+/// the art.
+fn text_mask(detections: &[KoharuLayoutDetection], image: &RgbImage, size: ImageSize) -> GrayImage {
+    let mut mask = GrayImage::new(size.width, size.height);
+    for detection in detections
+        .iter()
+        .filter(|detection| detection.label == "text")
+    {
+        stamp_mask(
+            &mut mask,
+            &glyph_mask(&detection.mask, detection.bbox, image),
+            0,
+            0,
+        );
+    }
+    mask
+}
+
 async fn write_masks(
     input: &StageInput,
     edit: &mut koharu_scene::Edit,
     page: EntityId,
+    image: &RgbImage,
     detections: &[KoharuLayoutDetection],
     size: ImageSize,
 ) -> Result<()> {
-    write_mask(input, edit, page, detections, size).await?;
+    write_mask(input, edit, page, image, detections, size).await?;
     edit.remove_asset(page, &AssetRole::new("bubble-mask")?)?;
     Ok(())
 }
@@ -1374,17 +1400,11 @@ async fn write_mask(
     input: &StageInput,
     edit: &mut koharu_scene::Edit,
     page: EntityId,
+    image: &RgbImage,
     detections: &[KoharuLayoutDetection],
     size: ImageSize,
 ) -> Result<()> {
-    let mut mask = if size.width > 0 && size.height > 0 {
-        let radius = ((size.width.max(size.height) as f32 / 1024.0) * 6.0)
-            .round()
-            .clamp(1.0, 255.0) as u8;
-        closed_mask_for(detections, "text", size, radius)
-    } else {
-        mask_for(detections, "text", size)
-    };
+    let mut mask = text_mask(detections, image, size);
     if let Some(bounds) = input.region {
         preserve_mask_outside_region(input, page, "text-mask", bounds, &mut mask).await?;
     }
@@ -1454,85 +1474,6 @@ fn region_kind(label: &str) -> Result<RegionKind> {
     .map_err(Into::into)
 }
 
-fn mask_for(detections: &[KoharuLayoutDetection], label: &str, size: ImageSize) -> GrayImage {
-    let mut mask = GrayImage::new(size.width, size.height);
-    for detection in detections.iter().filter(|value| value.label == label) {
-        stamp_mask(&mut mask, &detection.mask, 0, 0);
-    }
-    mask
-}
-
-fn closed_mask_for(
-    detections: &[KoharuLayoutDetection],
-    label: &str,
-    size: ImageSize,
-    radius: u8,
-) -> GrayImage {
-    let masks = detections
-        .iter()
-        .filter(|detection| detection.label == label)
-        .map(|detection| &detection.mask)
-        .filter(|mask| valid_mask(mask) && mask.width > 0 && mask.height > 0)
-        .collect::<Vec<_>>();
-    let mut output = GrayImage::new(size.width, size.height);
-    if masks.is_empty() {
-        return output;
-    }
-
-    // Two dilations can make instances interact before the final erosion.
-    // Conservatively group their expanded bounds, then retain a third-radius
-    // halo so the local erosion observes the same zero/page-edge neighborhood
-    // as a full-page operation.
-    let interaction_radius = u32::from(radius) * 2;
-    let mut parents = (0..masks.len()).collect::<Vec<_>>();
-    for left in 0..masks.len() {
-        for right in left + 1..masks.len() {
-            if rectangles_touch(
-                expand_mask_bounds(masks[left], interaction_radius, size),
-                expand_mask_bounds(masks[right], interaction_radius, size),
-            ) {
-                union(&mut parents, left, right);
-            }
-        }
-    }
-
-    let mut groups = BTreeMap::<usize, Vec<usize>>::new();
-    for index in 0..masks.len() {
-        let root = find(&mut parents, index);
-        groups.entry(root).or_default().push(index);
-    }
-    let local_masks = groups
-        .into_values()
-        .collect::<Vec<_>>()
-        .into_par_iter()
-        .filter_map(|group| {
-            let mut bounds = mask_bounds(masks[group[0]], size);
-            for &index in &group[1..] {
-                bounds = union_bounds(bounds, mask_bounds(masks[index], size));
-            }
-            bounds = expand_bounds(bounds, u32::from(radius) * 3, size);
-            let [left, top, right, bottom] = bounds;
-            if left >= right || top >= bottom {
-                return None;
-            }
-            let mut local = GrayImage::new(right - left, bottom - top);
-            for &index in &group {
-                stamp_mask(&mut local, masks[index], left, top);
-            }
-            let local = close(&dilate(&local, Norm::L2, radius), Norm::L2, radius);
-            Some((left, top, local))
-        })
-        .collect::<Vec<_>>();
-    for (left, top, local) in local_masks {
-        for (x, y, pixel) in local.enumerate_pixels() {
-            if pixel.0[0] != 0 {
-                output.put_pixel(left + x, top + y, Luma([u8::MAX]));
-            }
-        }
-    }
-    output
-}
-
 fn valid_mask(mask: &KoharuLayoutMask) -> bool {
     mask.width
         .checked_mul(mask.height)
@@ -1569,57 +1510,6 @@ fn stamp_mask(target: &mut GrayImage, mask: &KoharuLayoutMask, origin_x: u32, or
     }
 }
 
-fn mask_bounds(mask: &KoharuLayoutMask, size: ImageSize) -> [u32; 4] {
-    [
-        mask.x.min(size.width),
-        mask.y.min(size.height),
-        mask.x.saturating_add(mask.width).min(size.width),
-        mask.y.saturating_add(mask.height).min(size.height),
-    ]
-}
-
-fn expand_mask_bounds(mask: &KoharuLayoutMask, radius: u32, size: ImageSize) -> [u32; 4] {
-    expand_bounds(mask_bounds(mask, size), radius, size)
-}
-
-fn expand_bounds([left, top, right, bottom]: [u32; 4], radius: u32, size: ImageSize) -> [u32; 4] {
-    [
-        left.saturating_sub(radius),
-        top.saturating_sub(radius),
-        right.saturating_add(radius).min(size.width),
-        bottom.saturating_add(radius).min(size.height),
-    ]
-}
-
-fn union_bounds(left: [u32; 4], right: [u32; 4]) -> [u32; 4] {
-    [
-        left[0].min(right[0]),
-        left[1].min(right[1]),
-        left[2].max(right[2]),
-        left[3].max(right[3]),
-    ]
-}
-
-fn rectangles_touch(left: [u32; 4], right: [u32; 4]) -> bool {
-    left[0] <= right[2] && right[0] <= left[2] && left[1] <= right[3] && right[1] <= left[3]
-}
-
-fn find(parents: &mut [usize], mut index: usize) -> usize {
-    while parents[index] != index {
-        parents[index] = parents[parents[index]];
-        index = parents[index];
-    }
-    index
-}
-
-fn union(parents: &mut [usize], left: usize, right: usize) {
-    let left = find(parents, left);
-    let right = find(parents, right);
-    if left != right {
-        parents[right] = left;
-    }
-}
-
 fn intersects([left, top, right, bottom]: [f32; 4], region: crate::Bounds) -> bool {
     left < (region.x + region.width) as f32
         && right > region.x as f32
@@ -1627,35 +1517,8 @@ fn intersects([left, top, right, bottom]: [f32; 4], region: crate::Bounds) -> bo
         && bottom > region.y as f32
 }
 
-fn detection_order(left: &KoharuLayoutDetection, right: &KoharuLayoutDetection) -> Ordering {
-    left.bbox[1]
-        .total_cmp(&right.bbox[1])
-        .then_with(|| right.bbox[0].total_cmp(&left.bbox[0]))
-        .then_with(|| left.label.cmp(&right.label))
-}
-
-fn non_maximum_suppression(detections: &mut Vec<KoharuLayoutDetection>, threshold: f32) {
-    detections.sort_by(|left, right| {
-        right
-            .score
-            .total_cmp(&left.score)
-            .then_with(|| detection_order(left, right))
-    });
-    let mut kept = Vec::with_capacity(detections.len());
-    for candidate in detections.drain(..) {
-        let suppressed = kept.iter().any(|existing: &KoharuLayoutDetection| {
-            existing.label == candidate.label
-                && intersection_over_union(existing.bbox, candidate.bbox) >= threshold
-        });
-        if !suppressed {
-            kept.push(candidate);
-        }
-    }
-    *detections = kept;
-}
-
 fn sort_by_layout(detections: &mut Vec<KoharuLayoutDetection>) {
-    let order = layout_order(detections);
+    let order = order::sort(detections);
     let mut values = std::mem::take(detections)
         .into_iter()
         .map(Some)
@@ -1668,102 +1531,6 @@ fn sort_by_layout(detections: &mut Vec<KoharuLayoutDetection>) {
                 .expect("layout order contains each detection once")
         })
         .collect();
-}
-
-fn layout_order(detections: &[KoharuLayoutDetection]) -> Vec<usize> {
-    let panels = indices_with_label(detections, "panel");
-    let bubbles = indices_with_label(detections, "bubble");
-    let texts = indices_with_label(detections, "text");
-
-    let mut panel_for_bubble = vec![None; detections.len()];
-    for &bubble in &bubbles {
-        panel_for_bubble[bubble] = best_container(detections, bubble, &panels);
-    }
-    let mut bubble_for_text = vec![None; detections.len()];
-    let mut panel_for_text = vec![None; detections.len()];
-    for &text in &texts {
-        let bubble = best_container(detections, text, &bubbles);
-        bubble_for_text[text] = bubble;
-        panel_for_text[text] = bubble
-            .and_then(|bubble| panel_for_bubble[bubble])
-            .or_else(|| best_container(detections, text, &panels));
-    }
-
-    let mut parent = vec![None; detections.len()];
-    for bubble in bubbles {
-        parent[bubble] = panel_for_bubble[bubble];
-    }
-    for text in texts {
-        parent[text] = bubble_for_text[text].or(panel_for_text[text]);
-    }
-
-    let mut roots = Vec::new();
-    let mut children = vec![Vec::new(); detections.len()];
-    for (index, parent) in parent.into_iter().enumerate() {
-        if let Some(parent) = parent {
-            children[parent].push(index);
-        } else {
-            roots.push(index);
-        }
-    }
-    sort_spatial(detections, &mut roots);
-    for siblings in &mut children {
-        sort_spatial(detections, siblings);
-    }
-
-    let mut order = Vec::with_capacity(detections.len());
-    for root in roots {
-        append_layout_subtree(root, &children, &mut order);
-    }
-    order
-}
-
-fn indices_with_label(detections: &[KoharuLayoutDetection], label: &str) -> Vec<usize> {
-    detections
-        .iter()
-        .enumerate()
-        .filter_map(|(index, detection)| (detection.label == label).then_some(index))
-        .collect()
-}
-
-fn append_layout_subtree(index: usize, children: &[Vec<usize>], order: &mut Vec<usize>) {
-    order.push(index);
-    for &child in &children[index] {
-        append_layout_subtree(child, children, order);
-    }
-}
-
-fn sort_spatial(detections: &[KoharuLayoutDetection], indices: &mut [usize]) {
-    indices.sort_by(|&left, &right| {
-        detection_order(&detections[left], &detections[right])
-            .then_with(|| detections[right].score.total_cmp(&detections[left].score))
-            .then_with(|| left.cmp(&right))
-    });
-}
-
-fn best_container(
-    detections: &[KoharuLayoutDetection],
-    value: usize,
-    candidates: &[usize],
-) -> Option<usize> {
-    candidates
-        .iter()
-        .copied()
-        .filter(|&candidate| containment(detections[candidate].bbox, detections[value].bbox) >= 0.5)
-        .min_by(|&left, &right| {
-            area(detections[left].bbox)
-                .total_cmp(&area(detections[right].bbox))
-                .then_with(|| detection_order(&detections[left], &detections[right]))
-                .then_with(|| left.cmp(&right))
-        })
-}
-
-fn containment(container: [f32; 4], value: [f32; 4]) -> f32 {
-    let value_area = area(value);
-    if value_area <= 0.0 {
-        return 0.0;
-    }
-    intersection_area(container, value) / value_area
 }
 
 fn mask_containment(
@@ -1815,32 +1582,9 @@ fn mask_containment(
     }
 }
 
-fn intersection_over_union(left: [f32; 4], right: [f32; 4]) -> f32 {
-    let intersection = intersection_area(left, right);
-    let union = area(left) + area(right) - intersection;
-    if union <= 0.0 {
-        0.0
-    } else {
-        intersection / union
-    }
-}
-
-fn intersection_area(left: [f32; 4], right: [f32; 4]) -> f32 {
-    (left[2].min(right[2]) - left[0].max(right[0])).max(0.0)
-        * (left[3].min(right[3]) - left[1].max(right[1])).max(0.0)
-}
-
-fn area(bounds: [f32; 4]) -> f32 {
-    (bounds[2] - bounds[0]).max(0.0) * (bounds[3] - bounds[1]).max(0.0)
-}
-
 #[cfg(test)]
 mod tests {
     use image::{Rgb, RgbImage};
-    use imageproc::{
-        distance_transform::Norm,
-        morphology::{close, dilate},
-    };
     use koharu_ml::koharu_layout_rfdetr_seg_2xl::{KoharuLayoutDetection, KoharuLayoutMask};
     use koharu_scene::{
         At, BubbleRegion, FitsTo, FlowsIn, Geometry, Inside, Origin, PageDraft, Session,
@@ -1850,9 +1594,9 @@ mod tests {
     use super::{
         DIALOGUE_MASK_CONTAINMENT_THRESHOLD, DetectedRegion, DetectedText, DetectionModel,
         ImageSize, KoharuLayoutRFDetrSeg2XLConfig, MaskPixel, PageRegions, Processor, RegionOutput,
-        StageInput, StageProcessor, closed_mask_for, color_palette, generation, infer_typography,
-        layout_order, link_dialogue_regions, mask_containment, mask_for, mask_geometry,
-        non_maximum_suppression, normalize_text_color, write_region,
+        StageInput, StageProcessor, color_palette, generation, infer_typography,
+        link_dialogue_regions, mask_containment, mask_geometry, normalize_text_color, text_mask,
+        write_region,
     };
 
     #[test]
@@ -1860,6 +1604,7 @@ mod tests {
         let processor = Processor::new(
             DetectionModel::KoharuLayoutRFDetrSeg2XL(KoharuLayoutRFDetrSeg2XLConfig {
                 text_threshold: Some(15.0),
+                onomatopoeia_threshold: Some(f32::NAN),
                 bubble_threshold: Some(f32::NAN),
                 panel_threshold: Some(0.55),
             }),
@@ -1868,6 +1613,7 @@ mod tests {
 
         let DetectionModel::KoharuLayoutRFDetrSeg2XL(settings) = &processor.config;
         assert_eq!(settings.text_threshold, None);
+        assert_eq!(settings.onomatopoeia_threshold, None);
         assert_eq!(settings.bubble_threshold, None);
         assert_eq!(settings.panel_threshold, Some(0.55));
     }
@@ -1993,23 +1739,6 @@ mod tests {
                 .target,
             bubble
         );
-    }
-
-    fn detection(label: &str, score: f32, bbox: [f32; 4]) -> KoharuLayoutDetection {
-        KoharuLayoutDetection {
-            label_id: 0,
-            label: label.to_owned(),
-            score,
-            bbox,
-            area: 0,
-            mask: KoharuLayoutMask {
-                x: 0,
-                y: 0,
-                width: 1,
-                height: 1,
-                pixels: vec![0],
-            },
-        }
     }
 
     #[test]
@@ -2270,63 +1999,50 @@ mod tests {
     }
 
     #[test]
-    fn nms_removes_lower_scored_overlapping_regions_per_class() {
-        let mut detections = vec![
-            detection("text", 0.8, [5.0, 5.0, 105.0, 105.0]),
-            detection("bubble", 0.7, [0.0, 0.0, 100.0, 100.0]),
-            detection("text", 0.9, [0.0, 0.0, 100.0, 100.0]),
-            detection("text", 0.5, [20.0, 20.0, 80.0, 80.0]),
-            detection("text", 0.6, [200.0, 0.0, 250.0, 50.0]),
-        ];
-
-        non_maximum_suppression(&mut detections, 0.5);
-
-        let text_scores = detections
-            .iter()
-            .filter(|detection| detection.label == "text")
-            .map(|detection| detection.score)
-            .collect::<Vec<_>>();
-        assert_eq!(text_scores, [0.9, 0.6, 0.5]);
-        assert!(
-            detections
-                .iter()
-                .any(|detection| detection.label == "bubble")
-        );
-    }
-
-    #[test]
     fn text_mask_excludes_onomatopoeia() {
-        let detection = |label: &str, x: u32, value: u8| KoharuLayoutDetection {
+        // A dark glyph at the left, which the text detection covers, and a
+        // second one at the right, which an onomatopoeia detection covers.
+        let mut page = RgbImage::from_pixel(16, 8, Rgb([255, 255, 255]));
+        let glyph = |page: &mut RgbImage, left: u32| {
+            for y in 2..6 {
+                for x in left..left + 4 {
+                    page.put_pixel(x, y, Rgb([0, 0, 0]));
+                }
+            }
+        };
+        glyph(&mut page, 2);
+        glyph(&mut page, 10);
+        let detection = |label: &str, left: u32| KoharuLayoutDetection {
             label_id: 0,
             label: label.to_owned(),
             score: 1.0,
-            bbox: [x as f32, 0.0, x as f32 + 1.0, 1.0],
-            area: u32::from(value != 0),
+            bbox: [left as f32, 2.0, left as f32 + 4.0, 6.0],
+            area: 16,
             mask: KoharuLayoutMask {
-                x,
-                y: 0,
-                width: 1,
-                height: 1,
-                pixels: vec![value],
+                x: left,
+                y: 2,
+                width: 4,
+                height: 4,
+                pixels: vec![u8::MAX; 16],
             },
         };
         let detections = vec![
-            detection("bubble", 0, 0),
-            detection("onomatopoeia", 0, 255),
-            detection("text", 1, 255),
-            detection("onomatopoeia", 3, 255),
+            detection("bubble", 0),
+            detection("onomatopoeia", 10),
+            detection("text", 2),
         ];
 
-        let mask = mask_for(
+        let mask = text_mask(
             &detections,
-            "text",
+            &page,
             ImageSize {
-                width: 4,
-                height: 1,
+                width: 16,
+                height: 8,
             },
         );
 
-        assert_eq!(mask.as_raw(), &[0, 255, 0, 0]);
+        assert_eq!(mask.get_pixel(3, 3).0[0], u8::MAX);
+        assert_eq!(mask.get_pixel(11, 3).0[0], 0);
     }
 
     #[test]
@@ -2393,130 +2109,6 @@ mod tests {
         assert_eq!(mask_containment(&valid, &malformed, bounds), 0.0);
         assert_eq!(mask_containment(&valid, &different_size, bounds), 1.0);
     }
-
-    #[test]
-    fn local_mask_morphology_matches_the_full_page_operation() {
-        let size = ImageSize {
-            width: 64,
-            height: 48,
-        };
-        let local = |x, y, width, height, pixels: Vec<u8>| KoharuLayoutDetection {
-            label_id: 0,
-            label: "text".to_owned(),
-            score: 1.0,
-            bbox: [x as f32, y as f32, (x + width) as f32, (y + height) as f32],
-            area: pixels.iter().filter(|value| **value != 0).count() as u32,
-            mask: KoharuLayoutMask {
-                x,
-                y,
-                width,
-                height,
-                pixels,
-            },
-        };
-        let detections = vec![
-            local(0, 0, 4, 4, vec![255; 16]),
-            local(10, 8, 4, 4, vec![255; 16]),
-            local(19, 10, 3, 5, vec![255; 15]),
-            local(52, 40, 4, 3, vec![255; 12]),
-        ];
-        let radius = 3;
-        let page = mask_for(&detections, "text", size);
-        let expected = close(&dilate(&page, Norm::L2, radius), Norm::L2, radius);
-
-        assert_eq!(closed_mask_for(&detections, "text", size, radius), expected);
-    }
-
-    #[test]
-    fn local_mask_morphology_matches_varied_sparse_instances() {
-        let size = ImageSize {
-            width: 64,
-            height: 48,
-        };
-        let mut state = 0x7f4a_7c15_u32;
-        let mut next = || {
-            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-            state
-        };
-        for case in 0..24 {
-            let mut detections = Vec::new();
-            for _ in 0..8 {
-                let width = next() % 8 + 1;
-                let height = next() % 8 + 1;
-                let x = next() % (size.width - width + 1);
-                let y = next() % (size.height - height + 1);
-                let pixels = (0..width * height)
-                    .map(|_| if next() % 3 == 0 { 0 } else { u8::MAX })
-                    .collect::<Vec<_>>();
-                detections.push(KoharuLayoutDetection {
-                    label_id: 0,
-                    label: "text".to_owned(),
-                    score: 1.0,
-                    bbox: [x as f32, y as f32, (x + width) as f32, (y + height) as f32],
-                    area: pixels.iter().filter(|pixel| **pixel != 0).count() as u32,
-                    mask: KoharuLayoutMask {
-                        x,
-                        y,
-                        width,
-                        height,
-                        pixels,
-                    },
-                });
-            }
-            let radius = (case % 5 + 1) as u8;
-            let page = mask_for(&detections, "text", size);
-            let expected = close(&dilate(&page, Norm::L2, radius), Norm::L2, radius);
-            assert_eq!(
-                closed_mask_for(&detections, "text", size, radius),
-                expected,
-                "case {case}, radius {radius}"
-            );
-        }
-    }
-
-    #[test]
-    fn layout_order_follows_panels_then_bubbles_then_their_text() {
-        let detections = vec![
-            detection("text", 0.63, [20.0, 30.0, 70.0, 70.0]),
-            detection("bubble", 0.7, [10.0, 20.0, 80.0, 80.0]),
-            detection("panel", 0.9, [100.0, 0.0, 200.0, 200.0]),
-            detection("text", 0.62, [130.0, 110.0, 180.0, 150.0]),
-            detection("bubble", 0.8, [120.0, 20.0, 190.0, 80.0]),
-            detection("panel", 0.9, [0.0, 0.0, 95.0, 200.0]),
-            detection("text", 0.61, [130.0, 30.0, 180.0, 70.0]),
-            detection("bubble", 0.7, [120.0, 100.0, 190.0, 160.0]),
-        ];
-
-        let text_scores = layout_order(&detections)
-            .into_iter()
-            .filter_map(|index| {
-                (detections[index].label == "text").then_some(detections[index].score)
-            })
-            .collect::<Vec<_>>();
-
-        assert_eq!(text_scores, [0.61, 0.62, 0.63]);
-    }
-
-    #[test]
-    fn layout_order_merges_containers_and_text_at_each_spatial_level() {
-        let detections = vec![
-            detection("panel", 0.9, [0.0, 40.0, 200.0, 240.0]),
-            detection("bubble", 0.8, [100.0, 120.0, 190.0, 210.0]),
-            detection("text", 0.3, [120.0, 140.0, 180.0, 190.0]),
-            detection("text", 0.2, [20.0, 60.0, 180.0, 90.0]),
-            detection("text", 0.1, [20.0, 0.0, 180.0, 20.0]),
-        ];
-
-        let text_scores = layout_order(&detections)
-            .into_iter()
-            .filter_map(|index| {
-                (detections[index].label == "text").then_some(detections[index].score)
-            })
-            .collect::<Vec<_>>();
-
-        assert_eq!(text_scores, [0.1, 0.2, 0.3]);
-    }
-
     #[test]
     fn typography_comes_from_horizontal_text_mask() {
         let (image, detection) = masked_text(52.0, 12.0, 12.0, [24, 80, 160]);

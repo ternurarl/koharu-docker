@@ -18,7 +18,6 @@ pub struct KoharuLayoutRFDetrImageProcessor {
     resolution: i64,
     num_select: i64,
     class_names: Vec<String>,
-    recommended_thresholds: KoharuLayoutThresholds,
 }
 
 impl KoharuLayoutRFDetrImageProcessor {
@@ -33,12 +32,7 @@ impl KoharuLayoutRFDetrImageProcessor {
             resolution: config.resolution,
             num_select: config.num_select,
             class_names: config.class_names(),
-            recommended_thresholds: config.recommended_thresholds,
         })
-    }
-
-    pub(super) fn recommended_thresholds(&self) -> KoharuLayoutThresholds {
-        self.recommended_thresholds
     }
 
     pub(super) fn preprocess(&self, image: &DynamicImage, device: Device) -> Result<Tensor> {
@@ -144,9 +138,11 @@ impl KoharuLayoutRFDetrImageProcessor {
         let floats = Tensor::cat(&[scores.unsqueeze(1), boxes], 1);
         let floats = tensor_to_vec_f32(&floats)?;
         let labels = tensor_to_vec_i64(&labels)?;
+        let queries = tensor_to_vec_i64(&query_indexes)?;
 
-        let mut detections = Vec::with_capacity(labels.len());
-        for (index, label) in labels.into_iter().enumerate() {
+        let kept = one_label_per_query(&queries, &labels);
+        let mut detections = Vec::with_capacity(kept.len());
+        for index in kept {
             // RF-DETR defines masks by bilinearly projecting each native mask to
             // the source image and thresholding at zero. Resolve one mask at a
             // time to preserve that exact contract without retaining an
@@ -207,7 +203,7 @@ impl KoharuLayoutRFDetrImageProcessor {
                     )) * 255),
                 )?
             };
-            let label_id = label as usize;
+            let label_id = labels[index] as usize;
             detections.push(KoharuLayoutDetection {
                 label_id,
                 label: self
@@ -234,6 +230,39 @@ impl KoharuLayoutRFDetrImageProcessor {
             detections,
         })
     }
+}
+
+/// Text's label, first in the checkpoint's classes as in
+/// `KoharuLayoutThresholds::with_background`.
+const TEXT: i64 = 0;
+
+/// The selections to keep, in their order: one per query, its text if it has
+/// one, or else its best-scoring class, which the selections, sorted by
+/// score, list first.
+///
+/// RF-DETR keeps every class a query scores above its threshold, so one box
+/// can come back as both text and onomatopoeia (roboflow/rf-detr#1414). This
+/// checkpoint's classes are exclusive: in its training labels, text and
+/// onomatopoeia overlap by an IoU of 0.5 only 10 times in 172,836 boxes. On
+/// 212 pages of Blue Archive's comics, 77 boxes came back as both, and text
+/// was right for 42 of the 56 that could be told apart: the onomatopoeia
+/// class also scores asides and balloon lettering, while the higher score
+/// was right for 29.
+fn one_label_per_query(queries: &[i64], labels: &[i64]) -> Vec<usize> {
+    let mut chosen = std::collections::HashMap::new();
+    for (index, (&query, &label)) in queries.iter().zip(labels).enumerate() {
+        chosen
+            .entry(query)
+            .and_modify(|kept| {
+                if label == TEXT {
+                    *kept = index;
+                }
+            })
+            .or_insert(index);
+    }
+    let mut kept: Vec<usize> = chosen.into_values().collect();
+    kept.sort_unstable();
+    kept
 }
 
 fn validate_thresholds(thresholds: KoharuLayoutThresholds) -> Result<()> {
@@ -331,7 +360,17 @@ fn tensor_to_vec_u8(tensor: &Tensor) -> Result<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{KoharuLayoutThresholds, validate_thresholds};
+    use super::{KoharuLayoutThresholds, one_label_per_query, validate_thresholds};
+
+    #[test]
+    fn each_query_keeps_its_text_or_else_its_best_class() {
+        // Selections by score: query 3 as onomatopoeia then text, query 5 as
+        // a bubble, query 7 as a bubble then a panel.
+        let queries = [3, 3, 5, 7, 7];
+        let labels = [1, 0, 2, 2, 3];
+
+        assert_eq!(one_label_per_query(&queries, &labels), [1, 2, 3]);
+    }
 
     #[test]
     fn class_thresholds_must_be_probabilities() {
