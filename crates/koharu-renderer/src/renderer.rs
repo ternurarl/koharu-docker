@@ -45,7 +45,16 @@ use crate::{
 
 const MAX_SURFACE_DIMENSION: u32 = 32_768;
 const MAX_SURFACE_PIXELS: u64 = 268_435_456;
-const DEFAULT_RETAINED_NODES: usize = 2_048;
+/// How many bytes of retained node data the cache keeps.
+///
+/// Upstream commit 5f0fd18c replaced its entry-count bound with a byte bound for the same
+/// reason: one retained image node holds a whole decoded page, so a bound on the number of
+/// nodes bounds no memory. The budget matches `images::DEFAULT_IMAGE_CACHE_BYTES` because a
+/// retained image node keeps its `DecodedImage` alive after `ImageCache` has evicted it.
+const DEFAULT_RETAINED_NODE_BYTES: usize = 512 * 1024 * 1024;
+/// What a node without pixels counts as. A `vello::Scene` reports no size, so a text node
+/// carries this floor instead; upstream commit 5f0fd18c used the same flat estimate.
+const RETAINED_NODE_FLOOR_BYTES: usize = 1024;
 const MAX_RESOURCE_READS: usize = 8;
 const ASSETS_KIND: &str = "dev.koharu.assets";
 const MINIMUM_FONT_SIZE: f32 = 9.0;
@@ -104,7 +113,7 @@ impl Renderer {
                 fonts: Arc::new(Fonts::new()),
                 images: Mutex::new(ImageCache::new()),
                 image_loads: Mutex::new(HashMap::new()),
-                nodes: Mutex::new(NodeCache::new(DEFAULT_RETAINED_NODES)),
+                nodes: Mutex::new(NodeCache::new(DEFAULT_RETAINED_NODE_BYTES)),
                 workers: OnceLock::new(),
                 rasterizer: OnceCell::new(),
             }),
@@ -246,7 +255,7 @@ impl Renderer {
 
     /// Discards retained Vello nodes after their presentation resource lifetime ends.
     pub fn discard_retained_nodes(&self) {
-        self.inner.nodes.lock().entries.clear();
+        self.inner.nodes.lock().clear();
     }
 
     async fn rasterizer(&self) -> Result<Arc<Rasterizer>> {
@@ -1500,27 +1509,43 @@ fn resolve_stroke(typography: Option<&Typography>) -> Option<StrokeOptions> {
 
 struct CachedNode {
     node: Arc<RetainedNode>,
+    bytes: usize,
     last_used: u64,
 }
 
 struct NodeCache {
     entries: HashMap<(EntityId, EntityId), CachedNode>,
-    capacity: usize,
+    max_bytes: usize,
+    bytes: usize,
     clock: u64,
 }
 
 impl NodeCache {
-    fn new(capacity: usize) -> Self {
+    fn new(max_bytes: usize) -> Self {
         Self {
             entries: HashMap::new(),
-            capacity,
+            max_bytes,
+            bytes: 0,
             clock: 0,
         }
+    }
+
+    /// The bytes keeping `node` costs: its decoded pixels when it has them, and the floor
+    /// otherwise.
+    fn weight(node: &RetainedNode) -> usize {
+        node.pixels
+            .as_ref()
+            .map_or(RETAINED_NODE_FLOOR_BYTES, |pixels| pixels.byte_len())
     }
 
     fn next_clock(&mut self) -> u64 {
         self.clock = self.clock.wrapping_add(1);
         self.clock
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.bytes = 0;
     }
 
     fn get(
@@ -1538,17 +1563,16 @@ impl NodeCache {
     }
 
     fn insert(&mut self, key: (EntityId, EntityId), node: Arc<RetainedNode>, clock: u64) {
-        if self.capacity == 0 {
+        let bytes = Self::weight(&node);
+        if let Some(previous) = self.entries.remove(&key) {
+            self.bytes = self.bytes.saturating_sub(previous.bytes);
+        }
+        // A node heavier than the whole budget is not retained: keeping it would evict
+        // every other node and still exceed what the cache may hold.
+        if bytes > self.max_bytes {
             return;
         }
-        self.entries.insert(
-            key,
-            CachedNode {
-                node,
-                last_used: clock,
-            },
-        );
-        while self.entries.len() > self.capacity {
+        while self.bytes.saturating_add(bytes) > self.max_bytes {
             let Some(oldest) = self
                 .entries
                 .iter()
@@ -1557,8 +1581,19 @@ impl NodeCache {
             else {
                 break;
             };
-            self.entries.remove(&oldest);
+            if let Some(removed) = self.entries.remove(&oldest) {
+                self.bytes = self.bytes.saturating_sub(removed.bytes);
+            }
         }
+        self.bytes = self.bytes.saturating_add(bytes);
+        self.entries.insert(
+            key,
+            CachedNode {
+                node,
+                bytes,
+                last_used: clock,
+            },
+        );
     }
 }
 
@@ -2373,5 +2408,84 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("not contiguous"));
+    }
+
+    /// A retained image node holding `bytes` of decoded pixels and nothing else.
+    fn retained_image_node(bytes: usize) -> Arc<RetainedNode> {
+        Arc::new(RetainedNode {
+            descriptor: NodeDescriptor::Image(ImageNodeDescriptor {
+                blob: BlobId::for_bytes(b"node"),
+                expected_size: None,
+                require_size: None,
+            }),
+            scene: Arc::new(Scene::new()),
+            local_bounds: RenderBounds {
+                x: 0.0,
+                y: 0.0,
+                width: 1.0,
+                height: 1.0,
+            },
+            text: None,
+            pixels: Some(Arc::new(DecodedImage {
+                width: 1,
+                height: 1,
+                encoded: Arc::from(Vec::new()),
+                pixels: Arc::from(vec![0_u8; bytes]),
+            })),
+            diagnostics: Arc::from(Vec::new()),
+        })
+    }
+
+    /// Upstream commit 5f0fd18c replaced its bound on the number of retained entries with a
+    /// bound on their bytes, because one retained image node holds a whole decoded page.
+    #[test]
+    fn retained_node_cache_evicts_by_bytes_and_keeps_the_newest() {
+        let mut cache = NodeCache::new(3 * 1024 * 1024);
+        let mut keys = Vec::new();
+        for _ in 0..4 {
+            let key = (EntityId::new(), EntityId::new());
+            let clock = cache.next_clock();
+            cache.insert(key, retained_image_node(1024 * 1024), clock);
+            keys.push(key);
+        }
+        assert_eq!(
+            cache.entries.len(),
+            3,
+            "four nodes of 1 MiB each do not fit a 3 MiB budget"
+        );
+        assert_eq!(cache.bytes, 3 * 1024 * 1024);
+        assert!(
+            !cache.entries.contains_key(&keys[0]),
+            "the least recently used node is evicted first"
+        );
+        assert!(cache.entries.contains_key(&keys[3]));
+    }
+
+    #[test]
+    fn retained_node_cache_refuses_a_node_heavier_than_its_whole_budget() {
+        let mut cache = NodeCache::new(1024);
+        let clock = cache.next_clock();
+        cache.insert(
+            (EntityId::new(), EntityId::new()),
+            retained_image_node(2 * 1024),
+            clock,
+        );
+        assert!(cache.entries.is_empty());
+        assert_eq!(cache.bytes, 0);
+    }
+
+    #[test]
+    fn discarding_retained_nodes_releases_their_byte_count() {
+        let mut cache = NodeCache::new(1024 * 1024);
+        let clock = cache.next_clock();
+        cache.insert(
+            (EntityId::new(), EntityId::new()),
+            retained_image_node(512 * 1024),
+            clock,
+        );
+        assert_eq!(cache.bytes, 512 * 1024);
+        cache.clear();
+        assert!(cache.entries.is_empty());
+        assert_eq!(cache.bytes, 0);
     }
 }

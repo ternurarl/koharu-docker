@@ -89,9 +89,10 @@ struct GpuState {
     device: wgpu::Device,
     queue: wgpu::Queue,
     renderer: vello::Renderer,
-    targets: Vec<RenderTarget>,
+    targets: TargetPool,
 }
 
+/// The render surface and readback buffer for one output size.
 struct RenderTarget {
     width: u32,
     height: u32,
@@ -99,6 +100,87 @@ struct RenderTarget {
     texture: Texture,
     view: TextureView,
     readback: Buffer,
+}
+
+/// How many render targets the pool keeps.
+const MAX_POOLED_TARGETS: usize = 4;
+
+/// How many bytes of GPU render targets the pool keeps across calls.
+///
+/// Upstream commit fbe36bd9 capped its uploaded page textures at 256 MiB and upstream
+/// commit 5f0fd18c capped retained pixels. This fork keeps no per-page texture; the GPU
+/// memory that survives a render here is a pooled `RenderTarget`, which is an RGBA8
+/// texture plus a readback buffer of the same image. The count bound alone left four
+/// full pages of both resident.
+const MAX_POOLED_TARGET_BYTES: u64 = 256 << 20;
+
+/// Render targets kept for reuse, least recently used first out, bounded by byte budget.
+#[derive(Default)]
+struct TargetPool {
+    /// Each target with the clock value of the call that last took or returned it.
+    targets: Vec<(u64, RenderTarget)>,
+    clock: u64,
+}
+
+impl TargetPool {
+    fn next_clock(&mut self) -> u64 {
+        self.clock = self.clock.wrapping_add(1);
+        self.clock
+    }
+
+    /// Takes a target of exactly this size, or makes one.
+    ///
+    /// A size the GPU has no memory for fails here and leaves the pool as it was, so no
+    /// target the allocation failed for is kept.
+    fn take(&mut self, device: &wgpu::Device, width: u32, height: u32) -> Result<RenderTarget> {
+        let clock = self.next_clock();
+        match self
+            .targets
+            .iter()
+            .position(|(_, target)| target.width == width && target.height == height)
+        {
+            Some(position) => {
+                let mut entry = self.targets.swap_remove(position);
+                entry.0 = clock;
+                Ok(entry.1)
+            }
+            None => RenderTarget::new(device, width, height),
+        }
+    }
+
+    /// Keeps `target` for the next render, evicting the least recently used ones until it
+    /// fits the pool's count and byte bounds.
+    fn give_back(&mut self, target: RenderTarget) {
+        let bytes = target.byte_len();
+        // A target heavier than the whole budget is not pooled; keeping it would evict
+        // everything else and still exceed what the pool may hold.
+        if bytes > MAX_POOLED_TARGET_BYTES {
+            return;
+        }
+        while self.targets.len() >= MAX_POOLED_TARGETS
+            || self.retained_bytes().saturating_add(bytes) > MAX_POOLED_TARGET_BYTES
+        {
+            let Some(oldest) = self
+                .targets
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, (clock, _))| *clock)
+                .map(|(position, _)| position)
+            else {
+                break;
+            };
+            self.targets.remove(oldest);
+        }
+        let clock = self.next_clock();
+        self.targets.push((clock, target));
+    }
+
+    fn retained_bytes(&self) -> u64 {
+        self.targets
+            .iter()
+            .map(|(_, target)| target.byte_len())
+            .sum()
+    }
 }
 
 /// A reusable, headless Vello rasterizer.
@@ -131,7 +213,7 @@ impl Rasterizer {
                 device,
                 queue,
                 renderer,
-                targets: Vec::new(),
+                targets: TargetPool::default(),
             }),
         })
     }
@@ -158,12 +240,10 @@ impl Rasterizer {
             // No image layers: original single-scene Vello path, unchanged.
             let image = self
                 .rasterize_scene_inner(frame.scene(), width, height, [0, 0, 0, 0], options)
-                .map_err(crate::Error::Backend)?;
+                .map_err(classify)?;
             return Ok(Raster { image, left, top });
         }
-        let image = self
-            .rasterize_layered(frame, options)
-            .map_err(crate::Error::Backend)?;
+        let image = self.rasterize_layered(frame, options).map_err(classify)?;
         Ok(Raster { image, left, top })
     }
 
@@ -333,7 +413,7 @@ impl Rasterizer {
         options: RasterOptions,
     ) -> crate::Result<RgbaImage> {
         self.rasterize_scene_inner(scene, width, height, background, options)
-            .map_err(crate::Error::Backend)
+            .map_err(classify)
     }
 
     fn rasterize_scene_inner(
@@ -409,42 +489,40 @@ impl Rasterizer {
                     limits.max_texture_dimension_2d
                 );
             }
-            let target = targets
-                .iter()
-                .position(|target| target.width == width && target.height == height)
-                .map(|position| targets.swap_remove(position))
-                .map_or_else(|| RenderTarget::new(&device, width, height), Ok)?;
-            renderer
-                .render_to_texture(
-                    &device,
-                    queue,
-                    scene,
-                    &target.view,
-                    &RenderParams {
-                        base_color: rgba(background),
-                        width,
-                        height,
-                        antialiasing_method: AaConfig::Area,
-                    },
-                )
-                .map_err(|error| anyhow!("Vello rendering failed: {error:?}"))?;
+            let target = targets.take(&device, width, height)?;
+            let submission = checked(&device, || {
+                renderer
+                    .render_to_texture(
+                        &device,
+                        queue,
+                        scene,
+                        &target.view,
+                        &RenderParams {
+                            base_color: rgba(background),
+                            width,
+                            height,
+                            antialiasing_method: AaConfig::Area,
+                        },
+                    )
+                    .map_err(|error| anyhow!("Vello rendering failed: {error:?}"))?;
 
-            let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor {
-                label: Some("koharu text readback encoder"),
-            });
-            encoder.copy_texture_to_buffer(
-                target.texture.as_image_copy(),
-                TexelCopyBufferInfo {
-                    buffer: &target.readback,
-                    layout: wgpu::TexelCopyBufferLayout {
-                        offset: 0,
-                        bytes_per_row: Some(target.padded_width),
-                        rows_per_image: None,
+                let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor {
+                    label: Some("koharu text readback encoder"),
+                });
+                encoder.copy_texture_to_buffer(
+                    target.texture.as_image_copy(),
+                    TexelCopyBufferInfo {
+                        buffer: &target.readback,
+                        layout: wgpu::TexelCopyBufferLayout {
+                            offset: 0,
+                            bytes_per_row: Some(target.padded_width),
+                            rows_per_image: None,
+                        },
                     },
-                },
-                size,
-            );
-            let submission = queue.submit([encoder.finish()]);
+                    size,
+                );
+                Ok(queue.submit([encoder.finish()]))
+            })?;
             (device, submission, target)
         };
         let slice = target.readback.slice(..);
@@ -476,11 +554,10 @@ impl Rasterizer {
         }
         drop(mapped);
         target.readback.unmap();
+        // Only a target that rendered and read back is pooled; one the GPU failed on was
+        // dropped above and the next render allocates a fresh one.
         let mut gpu = self.gpu.lock();
-        const MAX_POOLED_TARGETS: usize = 4;
-        if gpu.targets.len() < MAX_POOLED_TARGETS {
-            gpu.targets.push(target);
-        }
+        gpu.targets.give_back(target);
         Ok(pixels)
     }
 }
@@ -525,17 +602,6 @@ impl RenderTarget {
             height,
             depth_or_array_layers: 1,
         };
-        let texture = device.create_texture(&TextureDescriptor {
-            label: Some("koharu text target"),
-            size,
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: TextureFormat::Rgba8Unorm,
-            usage: TextureUsages::STORAGE_BINDING | TextureUsages::COPY_SRC,
-            view_formats: &[],
-        });
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         let row_bytes = width
             .checked_mul(4)
             .context("render target row size overflow")?;
@@ -543,12 +609,26 @@ impl RenderTarget {
         let buffer_size = u64::from(padded_width)
             .checked_mul(u64::from(height))
             .context("render target buffer size overflow")?;
-        let readback = device.create_buffer(&BufferDescriptor {
-            label: Some("koharu text readback"),
-            size: buffer_size,
-            usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        let (texture, readback) = checked(device, || {
+            let texture = device.create_texture(&TextureDescriptor {
+                label: Some("koharu text target"),
+                size,
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: TextureFormat::Rgba8Unorm,
+                usage: TextureUsages::STORAGE_BINDING | TextureUsages::COPY_SRC,
+                view_formats: &[],
+            });
+            let readback = device.create_buffer(&BufferDescriptor {
+                label: Some("koharu text readback"),
+                size: buffer_size,
+                usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            Ok((texture, readback))
+        })?;
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         Ok(Self {
             width,
             height,
@@ -557,6 +637,59 @@ impl RenderTarget {
             view,
             readback,
         })
+    }
+
+    /// The GPU memory this target holds: one RGBA8 texture and its readback buffer.
+    fn byte_len(&self) -> u64 {
+        let texture = u64::from(self.width) * u64::from(self.height) * 4;
+        let readback = u64::from(self.padded_width) * u64::from(self.height);
+        texture.saturating_add(readback)
+    }
+}
+
+/// Marks a failure as the GPU having no memory, so `classify` can report it apart from the
+/// validation errors wgpu raises for whatever used the resource it could not make.
+#[derive(Debug)]
+struct OutOfMemory(String);
+
+impl std::fmt::Display for OutOfMemory {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for OutOfMemory {}
+
+/// Turns a wgpu failure into the renderer's own error, keeping running out of memory apart
+/// from the validation errors it causes.
+fn classify(error: anyhow::Error) -> crate::Error {
+    match error.downcast::<OutOfMemory>() {
+        Ok(out_of_memory) => crate::Error::OutOfMemory(out_of_memory.0),
+        Err(error) => crate::Error::Backend(error),
+    }
+}
+
+/// Runs `work`, which makes a GPU resource or records GPU work, inside error scopes.
+///
+/// Without them wgpu panics on an uncaptured error and a render that failed leaves what it
+/// read back blank. Running out of memory is reported ahead of the validation errors: wgpu
+/// makes a resource that was created while out of memory invalid for good, so every later
+/// use of it fails validation and would otherwise hide the allocation that failed.
+///
+/// Upstream commit 97b37768 keeps this on its `Gpu` type; this fork keeps the device in
+/// `GpuState` instead, so it is a free function over the device.
+fn checked<T>(device: &wgpu::Device, work: impl FnOnce() -> Result<T>) -> Result<T> {
+    let memory = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+    let validation = device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let result = work();
+    let invalid = pollster::block_on(validation.pop());
+    let short = pollster::block_on(memory.pop());
+    match short.or(invalid) {
+        Some(wgpu::Error::OutOfMemory { source }) => {
+            Err(anyhow::Error::new(OutOfMemory(source.to_string())))
+        }
+        Some(error) => Err(anyhow!("the GPU failed: {error}")),
+        None => result,
     }
 }
 
@@ -590,5 +723,27 @@ mod tests {
             .unwrap();
         assert_eq!(image.dimensions(), (4, 9000));
         assert_eq!(image.get_pixel(3, 8999).0, [10, 20, 30, 255]);
+    }
+
+    /// Upstream commits fbe36bd9 and 5f0fd18c bounded the GPU-side renderer memory by
+    /// bytes. The pool here bounds both how many targets it keeps and what they hold, and
+    /// it returns the least recently used one first.
+    #[test]
+    #[ignore = "requires a WGPU adapter"]
+    fn the_render_target_pool_stays_within_its_count_and_byte_bounds() {
+        let (device, _queue) = pollster::block_on(request_device()).unwrap();
+        let mut pool = TargetPool::default();
+        for _ in 0..8 {
+            pool.give_back(RenderTarget::new(&device, 512, 512).unwrap());
+        }
+        assert_eq!(pool.targets.len(), MAX_POOLED_TARGETS);
+        assert!(pool.retained_bytes() <= MAX_POOLED_TARGET_BYTES);
+
+        // A target heavier than the whole budget is not pooled at all.
+        let oversized = RenderTarget::new(&device, 8192, 8192).unwrap();
+        assert!(oversized.byte_len() > MAX_POOLED_TARGET_BYTES);
+        pool.give_back(oversized);
+        assert_eq!(pool.targets.len(), MAX_POOLED_TARGETS);
+        assert!(pool.retained_bytes() <= MAX_POOLED_TARGET_BYTES);
     }
 }

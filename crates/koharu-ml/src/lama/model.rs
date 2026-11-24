@@ -7,7 +7,7 @@ use std::path::Path;
 
 use anyhow::Result;
 use koharu_torch::{
-    Device, Kind, Tensor,
+    Cuda, Device, Kind, Tensor,
     nn::{self, Module, ModuleT},
 };
 
@@ -164,10 +164,40 @@ impl FFCResNetGenerator {
 
         let x = self.concat_tuple.forward(pair);
         let x = self.upsample.forward_t(&x, false);
-        self.final_conv
-            .forward(&x.reflection_pad2d([3, 3, 3, 3]))
-            .sigmoid()
+        let x = x.reflection_pad2d([3, 3, 3, 3]);
+        // Upstream commit 6f90b46a. With libtorch's cuDNN switch off, as the runtime
+        // keeps it for ROCm, a GPU convolution is PyTorch's native one, which unfolds
+        // all of its input first: 64 x 7 x 7 values for each output pixel, which is
+        // 7.5 GiB in F32 for an 800-pixel window, past an 8 GB card. Convolving bands
+        // of rows keeps one unfold within 256 MiB.
+        let output = if x.device().is_cuda() && !Cuda::user_enabled_cudnn() {
+            let size = x.size();
+            let width = size[3] - 6;
+            let row = size[1] * 7 * 7 * width * x.kind().elt_size_in_bytes() as i64;
+            let band = ((256 << 20) / row).max(1);
+            conv_rows_in_bands(&self.final_conv, &x, band)
+        } else {
+            self.final_conv.forward(&x)
+        };
+        output.sigmoid()
     }
+}
+
+/// `conv` over `padded` one band of output rows at a time.
+///
+/// An output pixel reads only its own 7 x 7 neighbourhood, so a band reads its own `band`
+/// output rows plus the three reflection rows above and below it; the bands join into the
+/// same image as one whole-image convolution, up to the order in which the kernel sums its
+/// terms. `band` is a parameter rather than derived here so a test can drive this on a CPU
+/// device, where `FFCResNetGenerator::forward` convolves in one call.
+fn conv_rows_in_bands(conv: &nn::Conv2D, padded: &Tensor, band: i64) -> Tensor {
+    let rows = padded.size()[2] - 6;
+    let band = band.max(1);
+    let bands = (0..rows)
+        .step_by(band as usize)
+        .map(|top| conv.forward(&padded.narrow(2, top, band.min(rows - top) + 6)))
+        .collect::<Vec<_>>();
+    Tensor::cat(&bands, 2)
 }
 
 #[derive(Debug)]
@@ -511,5 +541,37 @@ impl ConcatTupleLayer {
             Some(global) => Tensor::cat(&[input.0, global], 1),
             None => input.0,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The 7-pixel final convolution reads three reflection rows above and below each band,
+    /// so convolving bands of rows must reproduce one whole-image convolution.
+    ///
+    /// Runs on the CPU because `FFCResNetGenerator::forward` only bands while cuDNN is
+    /// disabled on a CUDA device; `conv_rows_in_bands` is the same code with the band
+    /// passed in. `nn::conv2d` initialises its own weights, so no checkpoint is needed.
+    #[test]
+    #[ignore = "requires the LibTorch runtime"]
+    fn row_bands_match_a_whole_image_convolution() -> anyhow::Result<()> {
+        let var_store = nn::VarStore::new(Device::Cpu);
+        let conv = nn::conv2d(&var_store.root(), 4, 2, 7, nn::ConvConfig::default());
+        // 20 output rows padded to 26, 8 output columns padded to 14.
+        let padded = Tensor::randn([1, 4, 26, 14], (Kind::Float, Device::Cpu));
+        let whole = conv.forward(&padded);
+
+        for band in [1_i64, 3, 20, 64] {
+            let banded = conv_rows_in_bands(&conv, &padded, band);
+            assert_eq!(banded.size(), whole.size(), "band {band} changed the shape");
+            let worst = whole.f_sub(&banded)?.abs().max().double_value(&[]);
+            assert!(
+                worst <= 1e-5,
+                "band {band} of rows differs from one whole-image convolution by {worst}"
+            );
+        }
+        Ok(())
     }
 }

@@ -16,7 +16,8 @@ pub(crate) struct DecodedImage {
 }
 
 impl DecodedImage {
-    fn byte_len(&self) -> usize {
+    /// The bytes this image keeps resident: its encoded source and its decoded pixels.
+    pub(crate) fn byte_len(&self) -> usize {
         self.encoded.len().saturating_add(self.pixels.len())
     }
 }

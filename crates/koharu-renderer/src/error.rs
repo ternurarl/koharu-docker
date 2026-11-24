@@ -37,6 +37,14 @@ pub enum Error {
 
     #[error("renderer backend failed")]
     Backend(#[source] anyhow::Error),
+
+    /// The GPU had no memory for what the render needed.
+    ///
+    /// wgpu reports the failed allocation and the invalid-resource validation errors that
+    /// follow from it as separate errors. Upstream commit 97b37768 reports the allocation
+    /// ahead of those, so a caller can tell running out of memory from a bad render request.
+    #[error("the GPU ran out of memory: {0}")]
+    OutOfMemory(String),
 }
 
 impl Error {
