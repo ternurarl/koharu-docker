@@ -84,8 +84,11 @@ impl KoharuLayoutRFDetrImageProcessor {
             "unexpected RF-DETR box shape {:?}",
             output.pred_boxes.size()
         );
+        // The segmentation head projects at a quarter of the input, as
+        // upstream 15914d76: 480 for the HighRes checkpoint's 1920.
+        let mask_size = self.resolution / 4;
         ensure!(
-            output.pred_masks.size() == [1, 300, 288, 288],
+            output.pred_masks.size() == [1, 300, mask_size, mask_size],
             "unexpected RF-DETR mask shape {:?}",
             output.pred_masks.size()
         );
