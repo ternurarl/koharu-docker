@@ -34,7 +34,7 @@ use specta::Type;
 use super::{StageInput, StageProcessor, finish, generation};
 use crate::{DetectionModel, ModelCell};
 
-const MODEL_ID: &str = "mayocream/koharu-layout-rfdetr-seg-2xl-1152";
+const MODEL_ID: &str = "mayocream/koharu-layout-highres";
 const MODEL_NAME: &str = "koharu-layout-rfdetr-seg-2xl";
 const PRODUCER: &str = "dev.koharu.pipeline.detection";
 const ANGLE_SNAP_DEGREES: f32 = 3.0;
@@ -320,7 +320,8 @@ fn write_regions<'a>(
     };
     for (index, (detection, inferred)) in detections.iter().zip(inferred).enumerate() {
         match write_region(edit, page, detection, inferred, generation)
-            .with_context(|| format!("failed to write {} detection {index}", detection.label))?        {
+            .with_context(|| format!("failed to write {} detection {index}", detection.label))?
+        {
             RegionOutput::Bubble(bubble) => regions.bubbles.push(bubble),
             RegionOutput::Text(text) => {
                 if let Some(group) = managed_text_group {

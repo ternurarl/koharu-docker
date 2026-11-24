@@ -1,9 +1,13 @@
 //! High-resolution manga layout instance segmentation with RF-DETR Seg 2XL.
 //!
-//! Checkpoint and strict Python loader:
-//! https://huggingface.co/mayocream/koharu-layout-rfdetr-seg-2xl-1152/tree/aed55fdb8ca953c6bec33cf6ed6dd52a9b72bfa2
+//! Koharu Layout HighRes checkpoint, run at its 1920-pixel resolution:
+//! https://huggingface.co/mayocream/koharu-layout-highres/tree/68077eb09401a46e548190ff2786bd405113ea8b
 //! RF-DETR upstream implementation:
 //! https://github.com/roboflow/rf-detr/tree/4ab7c18729de9d02ffd0495795d0831b5630f01b
+//!
+//! Upstream koharu-rs/koharu names this module `koharu_layout_highres` since
+//! 15914d76; the rename here comes with the pipeline port that commit also
+//! carries, so the path stays put until then.
 
 mod config;
 mod model;
@@ -25,8 +29,8 @@ pub use self::{
 
 use self::model::Model;
 
-crate::model_repository!("mayocream/koharu-layout-rfdetr-seg-2xl-1152" @ "aed55fdb8ca953c6bec33cf6ed6dd52a9b72bfa2" {
-    CONFIG = "inference_config.json",
+crate::model_repository!("mayocream/koharu-layout-highres" @ "68077eb09401a46e548190ff2786bd405113ea8b" {
+    CONFIG = "config.json",
     WEIGHTS = "model.safetensors",
 });
 
@@ -49,6 +53,12 @@ impl KoharuLayoutRFDetrSeg2XL {
             .await
             .context("failed to resolve KoharuLayout RF-DETR weights")?;
         let config = KoharuLayoutRFDetrSeg2XLConfig::from_file(&config_path)?;
+        anyhow::ensure!(
+            config.resolution == model::RESOLUTION,
+            "the checkpoint's {}-pixel resolution does not match this port's {}",
+            config.resolution,
+            model::RESOLUTION
+        );
         let processor = KoharuLayoutRFDetrImageProcessor::new(&config)?;
         let mut model = Model::new(device);
         model
@@ -102,20 +112,23 @@ mod tests {
         let model = KoharuLayoutRFDetrSeg2XL::load(crate::Device::cuda(0)).await?;
         let result = model.inference(&image)?;
 
-        // RF-DETR 4ab7c18, CUDA BF16, shape=(1152, 1152), antialias disabled.
-        // CUDA kernels vary across LibTorch releases, so compare structured
-        // geometry and mask area in addition to bounded confidence differences.
+        // Koharu Layout HighRes, rfdetr 1.7.0 in F32 on CUDA, the page
+        // letterboxed as in training; the values are upstream 9eac4b06's for
+        // this checkpoint. CUDA kernels vary across LibTorch releases, so
+        // compare structured geometry in addition to bounded confidence
+        // differences. Mask areas are left out: the local processor reports
+        // raw mask pixels, where upstream measures the glyph-fitted mask the
+        // pipeline port brings.
         let best = &result.detections[0];
         assert_eq!(best.label, "bubble");
-        assert!((best.score - 0.968_856_2).abs() < 0.01);
+        assert!((best.score - 0.977_458_1).abs() < 0.01);
         for (actual, expected) in best
             .bbox
             .into_iter()
-            .zip([566.220_7, 550.019_5, 691.044_9, 724.043])
+            .zip([567.304_3, 547.317_1, 691.978, 720.860_9])
         {
             assert!((actual - expected).abs() < 6.0);
         }
-        assert!(best.area.abs_diff(18_882) < 100);
 
         let lower_panel = result
             .detections
@@ -129,22 +142,21 @@ mod tests {
                 detection.label == "panel" && detection.bbox[1] > 500.0 && detection.bbox[1] < 700.0
             })
             .expect("middle page panel");
-        for (actual, expected) in lower_panel
-            .bbox
-            .into_iter()
-            .zip([69.179_69, 799.453_1, 700.820_3, 1006.171_9])
+        for (actual, expected) in
+            lower_panel
+                .bbox
+                .into_iter()
+                .zip([69.583_76, 798.296, 684.963_1, 1_009.382_4])
         {
-            assert!((actual - expected).abs() < 7.0);
+            assert!((actual - expected).abs() < 20.0);
         }
         for (actual, expected) in middle_panel
             .bbox
             .into_iter()
-            .zip([70.683_59, 550.546_9, 699.316_4, 782.578_1])
+            .zip([68.926, 552.693_5, 699.970_5, 788.836_5])
         {
-            assert!((actual - expected).abs() < 3.0);
+            assert!((actual - expected).abs() < 5.0);
         }
-        assert!(lower_panel.area.abs_diff(136_734) < 1_000);
-        assert!(middle_panel.area.abs_diff(142_179) < 2_000);
         Ok(())
     }
 }

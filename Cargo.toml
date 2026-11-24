@@ -184,6 +184,10 @@ tauri-macros = { git = "https://github.com/mayocream/tauri", rev = "9b8ba87f75b6
 tauri-plugin = { git = "https://github.com/mayocream/tauri", rev = "9b8ba87f75b62431c6464dfba6070217c6ad2164" }
 tauri-runtime = { git = "https://github.com/mayocream/tauri", rev = "9b8ba87f75b62431c6464dfba6070217c6ad2164" }
 tauri-utils = { git = "https://github.com/mayocream/tauri", rev = "9b8ba87f75b62431c6464dfba6070217c6ad2164" }
+# The published 0.27.0 with image-rs/imageproc#824: connected_components
+# panicked when every pixel started a component of its own, as a layout
+# detection's 1x1 glyph mask does.
+imageproc = { git = "https://github.com/mayocream/imageproc", rev = "8c64b41c0c715449b250d6c4e06516fe8310a7fa" }
 
 [profile.dev]
 debug = 1

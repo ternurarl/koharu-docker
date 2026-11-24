@@ -12,7 +12,7 @@ use koharu_torch::{
     nn::{self, Module},
 };
 
-const RESOLUTION: i64 = 1152;
+pub(super) const RESOLUTION: i64 = 1920;
 const PATCH_SIZE: i64 = 12;
 const NUM_WINDOWS: i64 = 2;
 const DINO_DIM: i64 = 384;
@@ -389,14 +389,47 @@ impl DinoAttention {
         let query = project(&self.query);
         let key = project(&self.key);
         let value = project(&self.value);
-        let context = Tensor::scaled_dot_product_attention::<&Tensor>(
-            &query, &key, &value, None, 0.0, false, None, false,
-        )
-        .permute([0, 2, 1, 3])
-        .contiguous()
-        .view([batch_size, sequence_length, DINO_DIM]);
+        let context = attention(&query, &key, &value)
+            .permute([0, 2, 1, 3])
+            .contiguous()
+            .view([batch_size, sequence_length, DINO_DIM]);
         self.dense.forward(&context)
     }
+}
+
+/// Upstream's `scaled_dot_product_attention`, a chunk of query rows at a time
+/// where libtorch has no fused kernel, as on ROCm for RDNA GPUs
+/// (koharu-rs/koharu#1408). Its math fallback holds the whole score matrix:
+/// for the full-attention layers' 25,604 tokens, 6 x 25,604^2 scores, 7.9 GB
+/// in BF16 and again for their softmax, past a 16 GB GPU. Each query row's
+/// softmax is its own, so the chunks give the single call's result. A fused
+/// kernel takes the whole call, as upstream's does: it holds no score matrix,
+/// and it rounds differently by chunk, enough to move this model's scores.
+fn attention(query: &Tensor, key: &Tensor, value: &Tensor) -> Tensor {
+    // PyTorch's `SDPBackend::math`.
+    const MATH: i64 = 0;
+    // Query rows a chunk takes on the math fallback.
+    const ROWS: i64 = 1024;
+    let attend = |query: &Tensor| {
+        Tensor::scaled_dot_product_attention::<&Tensor>(
+            query, key, value, None, 0.0, false, None, false,
+        )
+    };
+    let rows = query.size()[2];
+    // libtorch registers its kernel choice for CUDA devices, which HIP ones
+    // are to it, and not for MPS.
+    let math = matches!(query.device(), Device::Cuda(_))
+        && Tensor::internal_fused_sdp_choice::<&Tensor>(
+            query, key, value, None, 0.0, false, None, false,
+        ) == MATH;
+    if !math || rows <= ROWS {
+        return attend(query);
+    }
+    let chunks = (0..rows)
+        .step_by(ROWS as usize)
+        .map(|start| attend(&query.narrow(2, start, ROWS.min(rows - start))))
+        .collect::<Vec<_>>();
+    Tensor::cat(&chunks, 2)
 }
 
 #[derive(Debug)]
