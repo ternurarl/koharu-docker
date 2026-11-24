@@ -22,6 +22,12 @@ async fn main() -> Result<()> {
 
     koharu_ml::init().await?;
     let model = HayaiOcr::load(koharu_ml::device(cli.cpu)).await?;
-    println!("{}", model.inference(&image)?);
+    println!(
+        "{}",
+        model.inference(std::slice::from_ref(&image))?.join(
+            "
+"
+        )
+    );
     Ok(())
 }

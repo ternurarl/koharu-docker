@@ -16,7 +16,7 @@ async fn main() -> Result<()> {
     let image = image::open(&input)?;
     let model = HayaiOcr::load(koharu_ml::Device::default()).await?;
 
-    let warmup = model.inference(&image)?;
+    let warmup = model.inference(std::slice::from_ref(&image))?.remove(0);
     assert_eq!(warmup, "対策委員会です!");
     black_box(warmup);
 
@@ -30,7 +30,7 @@ async fn main() -> Result<()> {
     criterion.bench_function(&benchmark, |bencher| {
         bencher.iter(|| {
             let text = model
-                .inference(black_box(&image))
+                .inference(std::slice::from_ref(black_box(&image)))
                 .expect("Hayai OCR inference failed");
             black_box(text);
         });

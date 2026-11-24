@@ -158,12 +158,7 @@ impl Model {
                 })
                 .await?
             }
-            Self::Hayai(model) => {
-                infer_text(model.clone(), targets, |model, image| {
-                    model.inference(image)
-                })
-                .await?
-            }
+            Self::Hayai(model) => infer_hayai(model.clone(), targets).await?,
             Self::Paddle(model) => {
                 infer_text(model.clone(), targets, |model, image| {
                     Ok(model.inference(image, PaddleOCRVLTask::Ocr)?.text)
@@ -249,6 +244,36 @@ async fn infer_text<M: Send + 'static>(
                 })
             })
             .collect()
+    })
+    .await
+}
+
+/// Hayai decodes a page's crops together, padded to the longest, so its arm
+/// hands the whole batch to one call instead of going through `infer_text`.
+async fn infer_hayai(
+    model: Arc<Mutex<HayaiOcr>>,
+    targets: Vec<OcrTarget>,
+) -> Result<Vec<OcrResult>> {
+    tokio_rayon::spawn(move || {
+        let model = model
+            .lock()
+            .map_err(|_| anyhow!("OCR model lock is poisoned"))?;
+        let images = targets
+            .iter()
+            .map(|target| target.image.clone())
+            .collect::<Vec<_>>();
+        let texts = model.inference(&images)?;
+        Ok(targets
+            .into_iter()
+            .zip(texts)
+            .map(|(target, text)| OcrResult {
+                content: target.content,
+                region: target.region,
+                geometry: target.geometry,
+                previous: target.previous,
+                text: normalize_ocr_text(text),
+            })
+            .collect())
     })
     .await
 }
