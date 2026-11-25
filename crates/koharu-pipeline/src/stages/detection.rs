@@ -1377,8 +1377,8 @@ fn mask_geometry(mask: &KoharuLayoutMask) -> Option<Geometry> {
 }
 
 /// The page's text mask: each text detection's mask fitted to its glyphs, so
-/// inpainting redraws the lettering and not the paper or art between it, then
-/// grown past the glyphs' own edge. Onomatopoeia keeps out of it, as a drawn
+/// inpainting redraws the lettering and not the paper or art between it, and
+/// grown past each block's own glyphs. Onomatopoeia keeps out of it, as a drawn
 /// mark of its own is redrawn with the art.
 fn text_mask(detections: &[KoharuLayoutDetection], image: &RgbImage, size: ImageSize) -> GrayImage {
     let mut mask = GrayImage::new(size.width, size.height);
@@ -1386,32 +1386,57 @@ fn text_mask(detections: &[KoharuLayoutDetection], image: &RgbImage, size: Image
         .iter()
         .filter(|detection| detection.label == "text")
     {
-        stamp_mask(
-            &mut mask,
-            &glyph_mask(&detection.mask, detection.bbox, image),
-            0,
-            0,
-        );
+        let fitted = glyph_mask(&detection.mask, detection.bbox, image);
+        let radius = mask_dilation_radius(detection.bbox, size);
+        stamp_mask(&mut mask, &grown_mask(&fitted, radius, size), 0, 0);
     }
-    if mask.width() == 0 || mask.height() == 0 {
-        return mask;
-    }
-    dilate(
-        &mask,
-        Norm::L2,
-        mask_dilation_radius(size.width, size.height),
-    )
+    mask
 }
 
-/// The text mask's growth past the glyphs, 6 pixels per 1024 of the page's
-/// longer side. A mask edge that stops at the glyph hands the inpainter the
-/// lettering's own outline or halo as the boundary, and it repaints the covered
-/// strokes in that colour, leaving a ghost; the edge has to land on the paper
-/// or art around the lettering instead.
-fn mask_dilation_radius(width: u32, height: u32) -> u8 {
-    ((width.max(height) as f32 / 1024.0) * 6.0)
-        .round()
-        .clamp(1.0, 255.0) as u8
+/// `mask` widened by `radius` on every side, with the canvas it sits on grown
+/// by the same amount so the dilation is not cut off at the mask's own edge.
+/// Growth past the page is dropped, which is what keeping the canvas inside the
+/// page does.
+fn grown_mask(mask: &KoharuLayoutMask, radius: u8, size: ImageSize) -> KoharuLayoutMask {
+    let grown = u32::from(radius);
+    let left = grown.min(mask.x);
+    let top = grown.min(mask.y);
+    let right = grown.min(size.width.saturating_sub(mask.x.saturating_add(mask.width)));
+    let bottom = grown.min(
+        size.height
+            .saturating_sub(mask.y.saturating_add(mask.height)),
+    );
+    let mut canvas = GrayImage::new(mask.width + left + right, mask.height + top + bottom);
+    for (index, value) in mask.pixels.iter().enumerate() {
+        if *value == 0 {
+            continue;
+        }
+        let x = index as u32 % mask.width + left;
+        let y = index as u32 / mask.width + top;
+        canvas.put_pixel(x, y, Luma([u8::MAX]));
+    }
+    let dilated = dilate(&canvas, Norm::L2, radius);
+    KoharuLayoutMask {
+        x: mask.x - left,
+        y: mask.y - top,
+        width: dilated.width(),
+        height: dilated.height(),
+        pixels: dilated.into_raw(),
+    }
+}
+
+/// One detection's text-mask growth: a quarter of the block's shorter side,
+/// never more than 6 pixels per 1024 of the page's longer side. Manga
+/// Translator UI's `mask_refinement/text_mask_utils.py` sizes this growth from
+/// the line's glyph size, so small lettering keeps the art around it while a
+/// big sound effect still grows wide; this repository only has block-level
+/// boxes, so the box's shorter side stands in for the glyph size. A mask edge
+/// that stops at the glyph hands the inpainter the lettering's own outline or
+/// halo as the boundary, and it repaints the covered strokes in that colour.
+fn mask_dilation_radius(bbox: [f32; 4], size: ImageSize) -> u8 {
+    let page = ((size.width.max(size.height) as f32 / 1024.0) * 6.0).round();
+    let short_side = (bbox[2] - bbox[0]).min(bbox[3] - bbox[1]).max(1.0);
+    page.min((short_side * 0.25).round()).clamp(1.0, 32.0) as u8
 }
 
 async fn write_masks(
@@ -2085,7 +2110,7 @@ mod tests {
             width: 200,
             height: 200,
         };
-        let radius = mask_dilation_radius(size.width, size.height);
+        let radius = mask_dilation_radius(detection.bbox, size);
         let fitted = glyph_mask(&detection.mask, detection.bbox, &image);
         let mut fitted_page = GrayImage::new(size.width, size.height);
         stamp_mask(&mut fitted_page, &fitted, 0, 0);
@@ -2139,6 +2164,21 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn mask_dilation_radius_follows_the_glyph_size() {
+        let size = ImageSize {
+            width: 2048,
+            height: 2048,
+        };
+        let small = mask_dilation_radius([100.0, 100.0, 140.0, 140.0], size);
+        let large = mask_dilation_radius([100.0, 100.0, 300.0, 300.0], size);
+
+        assert!(
+            small < large,
+            "a small block grows less than a large one: {small} < {large}"
+        );
     }
 
     #[test]
