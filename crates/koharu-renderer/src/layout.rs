@@ -596,6 +596,9 @@ impl<'a> TextLayout<'a> {
                                 &mut shaped.glyphs,
                             );
                         }
+                        if self.writing_mode.is_vertical() {
+                            self.rotate_vertical_forms(font_size, shaping_text, &mut shaped.glyphs);
+                        }
                         if self.cjk_punctuation_layout {
                             self.layout_cjk_emphasis_runs(font_size, shaping_text, &mut shaped);
                         }
@@ -1234,6 +1237,62 @@ impl<'a> TextLayout<'a> {
             };
             glyph.x_offset = centered_x_offset(bounds.x_min, bounds.x_max);
             glyph.y_offset = glyph.y_advance * 0.5 - (bounds.y_min + bounds.y_max) * 0.5;
+        }
+    }
+
+    /// Turn the glyphs whose characters vertical text rotates, but only where
+    /// the font left them upright. A font that carries `vert`/`vrt2` already
+    /// answered with a vertical glyph, and turning that again would put it on
+    /// its side.
+    fn rotate_vertical_forms(
+        &self,
+        font_size: f32,
+        segment: &str,
+        glyphs: &mut [PositionedGlyph<'a>],
+    ) {
+        if segment.is_empty() || glyphs.is_empty() {
+            return;
+        }
+
+        let mut metrics_cache = HashMap::new();
+        for glyph in glyphs {
+            let cluster = glyph.cluster as usize;
+            let Some(ch) = segment.get(cluster..).and_then(|tail| tail.chars().next()) else {
+                continue;
+            };
+            if !vertical_rotation(ch) {
+                continue;
+            }
+            let Ok(font_ref) = glyph.font.skrifa_ref() else {
+                continue;
+            };
+            // The character's own glyph, before any `vert` substitution the
+            // shape plan asked for: equal ids mean the font has no vertical
+            // form and the renderer has to turn the glyph itself.
+            let Some(upright) = font_ref.charmap().map(ch) else {
+                continue;
+            };
+            if upright.to_u32() != glyph.glyph_id {
+                continue;
+            }
+
+            let key = font_key(glyph.font);
+            let glyph_metrics = match metrics_cache.entry(key) {
+                std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::hash_map::Entry::Vacant(entry) => entry
+                    .insert(font_ref.glyph_metrics(Size::new(font_size), glyph.font.location())),
+            };
+            let Some(bounds) = glyph_metrics.bounds(upright) else {
+                continue;
+            };
+
+            // A quarter turn clockwise maps (x, y) to (-y, x), so the rotated
+            // ink spans (-y_max, -y_min) across and (x_min, x_max) down.
+            let (new_x_min, new_x_max) = (-bounds.y_max, -bounds.y_min);
+            let (new_y_min, new_y_max) = (bounds.x_min, bounds.x_max);
+            glyph.rotate = true;
+            glyph.x_offset = centered_x_offset(new_x_min, new_x_max);
+            glyph.y_offset = glyph.y_advance * 0.5 - (new_y_min + new_y_max) * 0.5;
         }
     }
 
@@ -2029,6 +2088,19 @@ fn line_break_badness(line_advance: f32, max_extent: f32) -> f32 {
     } else {
         (line_advance - max_extent).powi(3) * LINE_BREAK_OVERFLOW_MULTIPLIER
     }
+}
+
+/// Whether vertical text sets `character` on its side.
+///
+/// UTR#50 puts the ellipsis and dash family in class R: the layout engine
+/// rotates them and the font need not carry a vertical form. The bundled
+/// western face maps U+2026 but has no `vert`/`vrt2`, so without this the
+/// vertical line shows a row of dots lying across it.
+fn vertical_rotation(character: char) -> bool {
+    matches!(
+        character,
+        '\u{2026}' | '\u{2025}' | '\u{22EF}' | '\u{2014}' | '\u{2015}'
+    )
 }
 
 fn centered_x_offset(x_min: f32, x_max: f32) -> f32 {
@@ -3537,5 +3609,86 @@ mod tests {
             "expected line centres to match even with overflow, got c0={c0} c1={c1} (max_width={max_width})",
         );
         Ok(())
+    }
+
+    /// A system font that draws the ellipsis with its own upright glyph in
+    /// vertical text, i.e. one without `vert`/`vrt2` for it. Latin faces are
+    /// the usual case; the bundled default face behaves the same way.
+    fn font_without_vertical_ellipsis() -> Option<Font> {
+        let mut system = FontSystem::new();
+        let ellipsis = '\u{2026}';
+        for name in [
+            "Arial",
+            "Liberation Sans",
+            "Helvetica",
+            "DejaVu Sans",
+            "Noto Sans",
+            "Carlito",
+        ] {
+            let Ok(font) = system.query_family(name) else {
+                continue;
+            };
+            let Ok(font_ref) = font.skrifa_ref() else {
+                continue;
+            };
+            let Some(upright) = font_ref.charmap().map(ellipsis) else {
+                continue;
+            };
+            let Ok(layout) = TextLayout::new(&font)
+                .with_font_size(32.0)
+                .with_writing_mode(WritingMode::VerticalRl)
+                .run("\u{2026}")
+            else {
+                continue;
+            };
+            if layout.lines[0]
+                .glyphs
+                .iter()
+                .any(|glyph| glyph.glyph_id == upright.to_u32())
+            {
+                return Some(font);
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn vertical_ellipsis_rotates_when_the_font_has_no_vertical_form() -> anyhow::Result<()> {
+        let Some(font) = font_without_vertical_ellipsis() else {
+            panic!("no system font keeps the upright ellipsis in vertical text");
+        };
+        let layout = TextLayout::new(&font)
+            .with_font_size(32.0)
+            .with_writing_mode(WritingMode::VerticalRl)
+            .run("あ\u{2026}\u{2026}")?;
+
+        let glyphs = &layout.lines[0].glyphs;
+        let ellipses = glyphs
+            .iter()
+            .filter(|glyph| glyph.cluster > 0)
+            .collect::<Vec<_>>();
+        assert_eq!(ellipses.len(), 2, "one glyph per ellipsis: {glyphs:?}");
+        for glyph in ellipses {
+            assert!(
+                glyph.rotate,
+                "the font has no vertical ellipsis, so it must be turned"
+            );
+        }
+        let kana = glyphs.iter().find(|glyph| glyph.cluster == 0).unwrap();
+        assert!(!kana.rotate, "a kana is already upright");
+        Ok(())
+    }
+
+    #[test]
+    fn vertical_rotation_covers_the_dash_family_only() {
+        for character in ['\u{2026}', '\u{2025}', '\u{22EF}', '\u{2014}', '\u{2015}'] {
+            assert!(vertical_rotation(character), "{character:?} is class R");
+        }
+        for character in ['あ', '、', '。', '「'] {
+            assert!(
+                !vertical_rotation(character),
+                "{character:?} is not class R"
+            );
+        }
     }
 }

@@ -422,8 +422,15 @@ fn draw_layout(
         while start < line.glyphs.len() {
             let font = line.glyphs[start].font;
             let key = font_key(font);
+            // A turned glyph is drawn by its own run: `glyph_transform` applies
+            // in glyph space, before the position offsets, so one run per
+            // orientation keeps the rotation about each pen position.
+            let rotate = line.glyphs[start].rotate;
             let mut end = start + 1;
-            while end < line.glyphs.len() && font_key(line.glyphs[end].font) == key {
+            while end < line.glyphs.len()
+                && font_key(line.glyphs[end].font) == key
+                && line.glyphs[end].rotate == rotate
+            {
                 end += 1;
             }
 
@@ -451,8 +458,14 @@ fn draw_layout(
                 run = run.normalized_coords(normalized_coords);
             }
             if let Some(angle) = font.synthetic_skew() {
-                run = run
-                    .glyph_transform(Some(Affine::skew(-(angle.to_radians().tan() as f64), 0.0)));
+                let skew = Affine::skew(-(angle.to_radians().tan() as f64), 0.0);
+                run = run.glyph_transform(Some(if rotate {
+                    skew * Affine::rotate(std::f64::consts::FRAC_PI_2)
+                } else {
+                    skew
+                }));
+            } else if rotate {
+                run = run.glyph_transform(Some(Affine::rotate(std::f64::consts::FRAC_PI_2)));
             }
             if font.synthetic_bold() {
                 run = run.font_embolden(FontEmbolden::new(Diagonal2::new(1.0, 1.0)));
@@ -670,6 +683,61 @@ mod tests {
                 && bounds.x + bounds.width <= descriptor.width + 0.01
                 && bounds.y + bounds.height <= descriptor.height + 0.01,
             "the stroked block stays inside its frame: {bounds:?}"
+        );
+    }
+
+    /// Two ellipses in a vertical line stack down the column; the same two in a
+    /// horizontal line lie side by side.
+    #[tokio::test]
+    async fn vertical_ellipsis_ink_stacks_vertically() {
+        let (family, fonts) = prepared_family().await;
+        let render = |writing_mode| {
+            let descriptor = TextNodeDescriptor {
+                text: "\u{2026}\u{2026}".to_owned(),
+                width: 200.0,
+                height: 400.0,
+                preferred_font: Some(family.clone()),
+                font_families: vec![family.clone()],
+                font_size: None,
+                writing_mode,
+                auto_fit: true,
+                is_fit_region: true,
+                text_inset: [4.0; 4],
+                ..descriptor()
+            };
+            TextRenderer::new()
+                .render_descriptor(&descriptor, &fonts)
+                .expect("the ellipses lay out")
+        };
+
+        // The layout box alone cannot carry this: a vertical run is taller than
+        // it is wide whether or not the ink is turned, so the glyph flags are
+        // checked too, with the same family shaped directly.
+        let font = crate::fonts::FontSystem::new()
+            .query_family(&family)
+            .expect("the prepared family resolves");
+        let shaped = TextLayout::new(&font)
+            .with_font_size(64.0)
+            .with_writing_mode(WritingMode::VerticalRl)
+            .run("\u{2026}\u{2026}")
+            .expect("the ellipses shape");
+        assert!(
+            shaped.lines[0].glyphs.iter().all(|glyph| glyph.rotate),
+            "the vertical ellipses are turned: {:?}",
+            shaped.lines[0].glyphs
+        );
+
+        let vertical = render(WritingMode::VerticalRl);
+        let horizontal = render(WritingMode::Horizontal);
+        assert!(
+            vertical.metadata.rendered_bounds.height > vertical.metadata.rendered_bounds.width,
+            "turned ellipses stack down the column: {:?}",
+            vertical.metadata.rendered_bounds
+        );
+        assert!(
+            horizontal.metadata.rendered_bounds.width > horizontal.metadata.rendered_bounds.height,
+            "upright ellipses lie along the line: {:?}",
+            horizontal.metadata.rendered_bounds
         );
     }
 

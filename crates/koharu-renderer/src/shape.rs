@@ -29,6 +29,11 @@ pub struct PositionedGlyph<'a> {
     /// How much the glyph moves on the Y-axis before drawing it, this should
     /// not affect how much the line advances.
     pub y_offset: f32,
+    /// Draw the glyph turned a quarter turn clockwise about its pen position.
+    /// Set when the cursor reaches a character that vertical text rotates —
+    /// a horizontal ellipsis or dash family member — and the font itself gives
+    /// no vertical form for it. The advance is unaffected.
+    pub rotate: bool,
 }
 
 /// A shaped run of text, containing positioned glyphs and overall advance.
@@ -114,6 +119,7 @@ impl TextShaper {
                 y_offset: (pos.y_offset as f32) * scale,
                 x_advance: (pos.x_advance as f32) * scale,
                 y_advance: (pos.y_advance as f32) * scale,
+                rotate: false,
             });
         }
 
