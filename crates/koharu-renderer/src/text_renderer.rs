@@ -42,6 +42,11 @@ pub(crate) struct TextNodeDescriptor {
     pub(crate) word_spacing: f32,
     pub(crate) text_inset: [f32; 4],
     pub(crate) point_text: bool,
+    /// The box is the detected `FitsTo` region, so its geometry is the only
+    /// statement about how much room the text may use.
+    pub(crate) is_fit_region: bool,
+    pub(crate) page_width: f32,
+    pub(crate) page_height: f32,
 }
 
 pub(crate) struct RenderedTextNode {
@@ -146,6 +151,13 @@ impl TextRenderer {
         };
         let bounds = if is_bubble_text {
             inset(frame, descriptor.text_inset)
+        } else if descriptor.is_fit_region {
+            let insetted = inset(frame, fit_text_inset(descriptor, frame));
+            if insetted.width > 0.0 && insetted.height > 0.0 {
+                insetted
+            } else {
+                frame
+            }
         } else {
             frame
         };
@@ -171,7 +183,7 @@ impl TextRenderer {
                 entity: descriptor.entity,
                 source,
             })?;
-        let automatic_maximum = || automatic_maximum(descriptor, bounds, is_bubble_text);
+        let automatic_maximum = || automatic_maximum(descriptor, bounds);
         let maximum = if descriptor.auto_fit {
             automatic_maximum()
         } else {
@@ -303,20 +315,46 @@ impl TextRenderer {
     }
 }
 
-fn automatic_maximum(
-    descriptor: &TextNodeDescriptor,
-    bounds: LayoutBox,
-    is_bubble_text: bool,
-) -> f32 {
-    if is_bubble_text {
-        if descriptor.writing_mode.is_vertical() {
+fn automatic_maximum(descriptor: &TextNodeDescriptor, bounds: LayoutBox) -> f32 {
+    if descriptor.balloon_contour.is_some() {
+        return if descriptor.writing_mode.is_vertical() {
             bounds.height
         } else {
             bounds.width
-        }
-    } else {
-        24.0
+        };
     }
+    if !descriptor.is_fit_region || descriptor.point_text || !descriptor.auto_fit {
+        return 24.0;
+    }
+    let geometric = bounds.width.min(bounds.height);
+    if visible_char_count(&descriptor.text) > 3 {
+        return geometric;
+    }
+    // A few characters in a loose detected box would otherwise be blown up to
+    // poster lettering; cap them with a reference size derived from the page
+    // resolution so the same page always yields the same short caption size.
+    let page_reference = descriptor.page_width.min(descriptor.page_height) * 0.028;
+    geometric.min((page_reference * 1.8).max(24.0))
+}
+
+/// Free text has no balloon padding, so the stroke bleed is folded into the
+/// inset; without it the outline crosses the detected box and touches the
+/// neighbouring panel border. The inset is capped at a quarter of the short
+/// edge so a small detected box keeps a layout area.
+fn fit_text_inset(descriptor: &TextNodeDescriptor, frame: LayoutBox) -> [f32; 4] {
+    let bleed = descriptor
+        .stroke
+        .map_or(0.0, |stroke| stroke.width_px.max(0.0));
+    let cap = frame.width.min(frame.height) * 0.25;
+    descriptor
+        .text_inset
+        .map(|edge| (edge + bleed).clamp(0.0, cap))
+}
+
+fn visible_char_count(text: &str) -> usize {
+    text.chars()
+        .filter(|character| !character.is_whitespace())
+        .count()
 }
 
 fn is_chinese_or_japanese_language(language: &str) -> bool {
@@ -425,9 +463,8 @@ mod tests {
 
     use super::*;
 
-    #[test]
-    fn automatic_size_preserves_free_text_default_and_balloon_extent() {
-        let descriptor = TextNodeDescriptor {
+    fn descriptor() -> TextNodeDescriptor {
+        TextNodeDescriptor {
             entity: EntityId::new(),
             text: "Hi".to_owned(),
             language: None,
@@ -450,15 +487,101 @@ mod tests {
             word_spacing: 0.0,
             text_inset: [0.0; 4],
             point_text: false,
-        };
-        let bounds = LayoutBox {
+            is_fit_region: false,
+            page_width: 1528.0,
+            page_height: 2047.0,
+        }
+    }
+
+    fn bounds() -> LayoutBox {
+        LayoutBox {
             x: 0.0,
             y: 0.0,
             width: 240.0,
             height: 120.0,
+        }
+    }
+
+    #[test]
+    fn automatic_size_uses_the_short_edge_for_fit_regions() {
+        let descriptor = TextNodeDescriptor {
+            text: "一二三四".to_owned(),
+            is_fit_region: true,
+            ..descriptor()
         };
 
-        assert_eq!(automatic_maximum(&descriptor, bounds, false), 24.0);
-        assert_eq!(automatic_maximum(&descriptor, bounds, true), 240.0);
+        assert_eq!(automatic_maximum(&descriptor, bounds()), 120.0);
+    }
+
+    #[test]
+    fn automatic_size_keeps_the_default_for_non_fit_text() {
+        let descriptor = TextNodeDescriptor {
+            text: "一二三四".to_owned(),
+            ..descriptor()
+        };
+
+        assert_eq!(automatic_maximum(&descriptor, bounds()), 24.0);
+    }
+
+    #[test]
+    fn automatic_size_keeps_the_default_for_point_text() {
+        let descriptor = TextNodeDescriptor {
+            text: "一二三四".to_owned(),
+            is_fit_region: true,
+            point_text: true,
+            ..descriptor()
+        };
+
+        assert_eq!(automatic_maximum(&descriptor, bounds()), 24.0);
+    }
+
+    #[test]
+    fn automatic_size_caps_short_fit_regions_by_page_resolution() {
+        let descriptor = TextNodeDescriptor {
+            text: "你好".to_owned(),
+            is_fit_region: true,
+            ..descriptor()
+        };
+
+        assert_eq!(
+            automatic_maximum(&descriptor, bounds()),
+            1528.0_f32.min(2047.0) * 0.028 * 1.8
+        );
+    }
+
+    #[test]
+    fn fit_text_inset_adds_stroke_bleed_and_stops_at_the_short_edge() {
+        let descriptor = TextNodeDescriptor {
+            text_inset: [4.0; 4],
+            stroke: Some(StrokeOptions {
+                color: [0, 0, 0, 255],
+                width_px: 6.0,
+            }),
+            ..descriptor()
+        };
+        assert_eq!(
+            fit_text_inset(
+                &descriptor,
+                LayoutBox {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 250.0,
+                    height: 450.0,
+                }
+            ),
+            [10.0; 4]
+        );
+        assert_eq!(
+            fit_text_inset(
+                &descriptor,
+                LayoutBox {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 4.0,
+                    height: 4.0,
+                }
+            ),
+            [1.0; 4]
+        );
     }
 }

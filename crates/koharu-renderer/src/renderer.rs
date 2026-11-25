@@ -798,15 +798,15 @@ impl Traversal<'_> {
             return Ok(None);
         }
         let authored = self.snapshot.component::<Geometry>(entity)?;
-        let placement = if let Some(placement) = self.balloon_flows.get(&entity) {
+        let (placement, from_fit) = if let Some(placement) = self.balloon_flows.get(&entity) {
             dependencies.extend(placement.dependencies.iter().cloned());
-            Some(placement.clone())
+            (Some(placement.clone()), false)
         } else if let Some(placement) = self.balloon_flow(entity, dependencies)? {
-            Some(placement)
+            (Some(placement), false)
         } else {
-            self.fit(entity, dependencies)?
+            (self.fit(entity, dependencies)?, true)
         };
-        let (geometry, frame, balloon_contour) = if let Some(geometry) = authored {
+        let (geometry, frame, balloon_contour, is_fit_region) = if let Some(geometry) = authored {
             let Some(frame) = geometry_frame(&geometry, layout.angle_degrees) else {
                 return Ok(None);
             };
@@ -814,7 +814,7 @@ impl Traversal<'_> {
                 .as_ref()
                 .and_then(|placement| placement.balloon_contour.as_ref())
                 .map(|_| contour(&geometry, frame));
-            (geometry, frame, balloon)
+            (geometry, frame, balloon, false)
         } else {
             let Some(placement) = placement else {
                 return Ok(None);
@@ -823,6 +823,7 @@ impl Traversal<'_> {
                 placement.geometry,
                 placement.frame,
                 placement.balloon_contour,
+                from_fit,
             )
         };
         let typography = self.snapshot.component::<Typography>(entity)?;
@@ -854,6 +855,7 @@ impl Traversal<'_> {
             dependencies.insert(RenderDependency::Font(family.clone()));
         }
         let is_bubble = balloon_contour.is_some();
+        let point_text = !is_bubble && layout.kind == TextLayoutKind::Point;
         let descriptor = TextNodeDescriptor {
             entity,
             text: text.clone(),
@@ -882,7 +884,10 @@ impl Traversal<'_> {
             letter_spacing: 0.0,
             word_spacing: 0.0,
             text_inset: [4.0; 4],
-            point_text: !is_bubble && layout.kind == TextLayoutKind::Point,
+            point_text,
+            is_fit_region: is_fit_region && !point_text,
+            page_width: self.width as f32,
+            page_height: self.height as f32,
         };
         Ok(Some(LayerDraft {
             entity,
@@ -2487,5 +2492,195 @@ mod tests {
         cache.clear();
         assert!(cache.entries.is_empty());
         assert_eq!(cache.bytes, 0);
+    }
+
+    fn text_renderer() -> Renderer {
+        let font = crate::fonts::FontSystem::new().first_font().unwrap();
+        Renderer::with_typesetting(TypesettingConfig {
+            font_families: vec![font.family_name().to_owned()],
+        })
+    }
+
+    fn translation(text: &str) -> Translation {
+        Translation {
+            text: Authored::user(text.to_owned()),
+            language: None,
+        }
+    }
+
+    /// Free and balloon text both need a source text next to the translation and
+    /// a layer that presents that content.
+    fn add_text(
+        edit: &mut koharu_scene::Edit,
+        page: EntityId,
+        text: &str,
+    ) -> koharu_scene::Result<(EntityId, EntityId)> {
+        let content = edit.add_text_content(page, At::End)?;
+        edit.set(
+            content,
+            &SourceText {
+                text: Authored::user(text.to_owned()),
+                language: None,
+            },
+        )?;
+        edit.set(content, &translation(text))?;
+        let layer = edit.add_text_layer(page, At::End, content, &paragraph())?;
+        Ok((content, layer))
+    }
+
+    fn paragraph() -> SceneTextLayout {
+        SceneTextLayout {
+            origin: Origin::User,
+            kind: TextLayoutKind::Paragraph,
+            angle_degrees: None,
+        }
+    }
+
+    fn text_metadata(frame: &Frame, entity: EntityId) -> TextMetadata {
+        match frame.layer(entity).expect("text layer is rendered").kind() {
+            LayerKind::Text(metadata) => metadata.clone(),
+            LayerKind::Image(_) => panic!("layer {entity} is not text"),
+        }
+    }
+
+    #[tokio::test]
+    async fn free_text_is_sized_by_its_detected_box() {
+        let mut session = Session::memory().await.unwrap();
+        let mut ids = None;
+        let patch = session
+            .snapshot()
+            .patch(|edit| {
+                let page = edit.add_page(PageDraft::new("page", 1528.0, 2047.0), At::End)?;
+                let region = edit.add_analysis_region::<koharu_scene::TextRegion>(
+                    page,
+                    At::End,
+                    &Geometry::rectangle(300.0, 400.0, 250.0, 450.0),
+                    None,
+                )?;
+                let (_, layer) = add_text(edit, page, "这是无气泡竖排旁白共十五个汉字")?;
+                edit.relate::<FitsTo>(layer, region)?;
+                ids = Some((page, layer));
+                Ok(())
+            })
+            .unwrap();
+        let snapshot = session.commit(patch).await.unwrap().snapshot;
+        let (page, layer) = ids.unwrap();
+
+        let frame = text_renderer().render(&snapshot, page).await.unwrap();
+        let metadata = text_metadata(&frame, layer);
+
+        assert_eq!(metadata.writing_mode, WritingMode::VerticalRl);
+        assert!(
+            metadata.font_size > 50.0,
+            "free text fills its detected box, got {}",
+            metadata.font_size
+        );
+        assert!(
+            metadata.rendered_bounds.width > metadata.font_size * 1.5,
+            "free text wraps into several vertical columns, got {:?}",
+            metadata.rendered_bounds
+        );
+    }
+
+    #[tokio::test]
+    async fn short_free_text_is_capped_by_the_page_resolution() {
+        let mut session = Session::memory().await.unwrap();
+        let mut ids = None;
+        let patch = session
+            .snapshot()
+            .patch(|edit| {
+                let page = edit.add_page(PageDraft::new("page", 1528.0, 2047.0), At::End)?;
+                let bubble = edit.add_analysis_region::<BubbleRegion>(
+                    page,
+                    At::End,
+                    &Geometry::rectangle(120.0, 1500.0, 420.0, 300.0),
+                    None,
+                )?;
+                let (_, balloon) = add_text(edit, page, "はい")?;
+                edit.relate::<FlowsIn>(balloon, bubble)?;
+
+                let region = edit.add_analysis_region::<koharu_scene::TextRegion>(
+                    page,
+                    At::End,
+                    &Geometry::rectangle(1000.0, 400.0, 220.0, 220.0),
+                    None,
+                )?;
+                let (_, layer) = add_text(edit, page, "了解")?;
+                edit.relate::<FitsTo>(layer, region)?;
+                ids = Some((page, balloon, layer));
+                Ok(())
+            })
+            .unwrap();
+        let snapshot = session.commit(patch).await.unwrap().snapshot;
+        let (page, balloon, layer) = ids.unwrap();
+
+        let frame = text_renderer().render(&snapshot, page).await.unwrap();
+        let capped = 1528.0_f32.min(2047.0) * 0.028 * 1.8;
+        let free = text_metadata(&frame, layer);
+        let balloon = text_metadata(&frame, balloon);
+
+        assert!(
+            free.font_size <= capped + 0.01,
+            "a two character caption must not become poster lettering: {} <= {capped}",
+            free.font_size
+        );
+        assert!(
+            balloon.font_size > capped,
+            "balloon text keeps its own cap: {} > {capped}",
+            balloon.font_size
+        );
+    }
+
+    #[tokio::test]
+    async fn free_text_stroke_stays_inside_the_detected_box() {
+        let mut session = Session::memory().await.unwrap();
+        let mut ids = None;
+        let patch = session
+            .snapshot()
+            .patch(|edit| {
+                let page = edit.add_page(PageDraft::new("page", 1528.0, 2047.0), At::End)?;
+                let region = edit.add_analysis_region::<koharu_scene::TextRegion>(
+                    page,
+                    At::End,
+                    &Geometry::rectangle(300.0, 400.0, 250.0, 450.0),
+                    None,
+                )?;
+                let (_, layer) = add_text(edit, page, "这是无气泡竖排旁白共十五个汉字")?;
+                edit.relate::<FitsTo>(layer, region)?;
+                edit.set(
+                    layer,
+                    &Typography {
+                        origin: Origin::User,
+                        preferred_font: None,
+                        font_weight: None,
+                        font_style: None,
+                        size: None,
+                        auto_fit: true,
+                        color: Some([0, 0, 0, 255]),
+                        stroke_color: Some([255, 255, 255, 255]),
+                        stroke_width: Some(6.0),
+                        alignment: None,
+                        writing_mode: None,
+                        extensions: BTreeMap::new(),
+                    },
+                )?;
+                ids = Some((page, layer));
+                Ok(())
+            })
+            .unwrap();
+        let snapshot = session.commit(patch).await.unwrap().snapshot;
+        let (page, layer) = ids.unwrap();
+
+        let frame = text_renderer().render(&snapshot, page).await.unwrap();
+        let bounds = frame.layer(layer).unwrap().bounds();
+
+        assert!(
+            bounds.x >= 300.0 - 0.01 && bounds.y >= 400.0 - 0.01,
+            "stroke must not cross the detected box: {bounds:?}"
+        );
+        assert!(
+            bounds.x + bounds.width <= 550.0 + 0.01 && bounds.y + bounds.height <= 850.0 + 0.01,
+            "stroke must not cross the detected box: {bounds:?}"
+        );
     }
 }
