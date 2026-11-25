@@ -85,3 +85,7 @@ koharu-memory-audit-*/
 /.claude
 /plan
 /plan
+
+# Local test pages and captures
+/测试*.jpg
+/image_test/
