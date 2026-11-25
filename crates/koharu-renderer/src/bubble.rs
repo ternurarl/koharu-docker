@@ -705,10 +705,15 @@ pub(crate) fn geometry_frame(
     }
 
     let scale = width.max(height).max(1.0);
-    let length_tolerance = scale * 1e-6;
+    // The tolerances are relative to the edges, not to f64's own resolution:
+    // these points have been through serialization and f32, and that rounding
+    // must not demote a tilted rectangle to its axis-aligned bounds, whose
+    // angle is then zero. 1e-3 still rejects any polygon that is visibly not a
+    // rectangle.
+    let length_tolerance = scale * 1e-3;
     let opposite_lengths_match = (bottom.0.hypot(bottom.1) - width).abs() <= length_tolerance
         && (left.0.hypot(left.1) - height).abs() <= length_tolerance;
-    let perpendicular = (top.0 * right.0 + top.1 * right.1).abs() <= width * height * 1e-6;
+    let perpendicular = ((top.0 * right.0 + top.1 * right.1) / (width * height)).abs() <= 1e-3;
     let diagonals_bisect = ((top_left.x + bottom_right.x) - (top_right.x + bottom_left.x)).abs()
         <= length_tolerance
         && ((top_left.y + bottom_right.y) - (top_right.y + bottom_left.y)).abs()
@@ -791,6 +796,49 @@ mod tests {
         assert!((authored.bounds.width - frame.bounds.width).abs() < 1e-4);
         assert!((authored.bounds.height - frame.bounds.height).abs() < 1e-4);
         assert_eq!(authored.angle_degrees, 27.0);
+    }
+
+    /// The geometry of a detected region is stored and read back, so its points
+    /// pass through `f32`. A tilted rectangle must keep its own axis across
+    /// that rounding instead of degrading to the axis-aligned box around it.
+    #[test]
+    fn a_tilted_rectangle_survives_an_f32_round_trip() {
+        let (sin, cos) = 30.0_f64.to_radians().sin_cos();
+        // A position on an A4-sized page at 300 dpi, where an f32 coordinate's
+        // last bit is about a tenth of a pixel.
+        let (center_x, center_y) = (2400.0_f64, 3400.0_f64);
+        let geometry = Geometry {
+            origin: Origin::User,
+            points: [
+                (-100.0, -15.0),
+                (100.0, -15.0),
+                (100.0, 15.0),
+                (-100.0, 15.0),
+            ]
+            .map(|(x, y)| Point {
+                x: f64::from((center_x + x * cos - y * sin) as f32),
+                y: f64::from((center_y + x * sin + y * cos) as f32),
+            })
+            .into(),
+        };
+
+        let frame = geometry_frame(&geometry, None).expect("a tilted rectangle keeps its axes");
+
+        assert!(
+            (frame.bounds.width - 200.0).abs() < 1.0,
+            "the long side survives: {}",
+            frame.bounds.width
+        );
+        assert!(
+            (frame.bounds.height - 30.0).abs() < 1.0,
+            "the short side survives: {}",
+            frame.bounds.height
+        );
+        assert!(
+            (frame.angle_degrees - 30.0).abs() < 0.01,
+            "the tilt survives: {}",
+            frame.angle_degrees
+        );
     }
 
     #[test]

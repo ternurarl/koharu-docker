@@ -358,7 +358,13 @@ fn write_region<'a>(
     } else if detection.label == "text" {
         inferred.map_or_else(
             || rectangle_geometry(detection.bbox),
-            |typography| rotated_rectangle_geometry(detection.bbox, typography.angle_degrees),
+            |typography| {
+                rotated_rectangle_geometry(
+                    &detection.mask,
+                    detection.bbox,
+                    typography.angle_degrees,
+                )
+            },
         )
     } else {
         rectangle_geometry(detection.bbox)
@@ -1320,14 +1326,46 @@ fn rectangle_geometry([left, top, right, bottom]: [f32; 4]) -> Geometry {
 }
 
 fn rotated_rectangle_geometry(
-    [left, top, right, bottom]: [f32; 4],
+    mask: &KoharuLayoutMask,
+    bbox: [f32; 4],
     angle_degrees: f32,
 ) -> Geometry {
-    let width = f64::from((right - left).max(1.0));
-    let height = f64::from((bottom - top).max(1.0));
+    if angle_degrees.abs() < ANGLE_SNAP_DEGREES || mask.width == 0 || !valid_mask(mask) {
+        return rectangle_geometry(bbox);
+    }
+    let [left, top, right, bottom] = bbox;
     let center_x = f64::from(left + right) * 0.5;
     let center_y = f64::from(top + bottom) * 0.5;
     let (sin, cos) = f64::from(angle_degrees).to_radians().sin_cos();
+    // `bbox` is the axis-aligned box of glyphs already tilted by
+    // `angle_degrees`, so turning its own width and height by that angle scales
+    // the box by cos + sin. The tight oriented box only comes from the mask
+    // pixels, each turned back into the text axes the angle names.
+    let (mut min_x, mut min_y) = (f64::INFINITY, f64::INFINITY);
+    let (mut max_x, mut max_y) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
+    let mut foreground = 0_usize;
+    for (index, value) in mask.pixels.iter().enumerate() {
+        if *value == 0 {
+            continue;
+        }
+        foreground += 1;
+        let x = f64::from(mask.x + index as u32 % mask.width) + 0.5;
+        let y = f64::from(mask.y + index as u32 / mask.width) + 0.5;
+        let (dx, dy) = (x - center_x, y - center_y);
+        let local_x = dx * cos + dy * sin;
+        let local_y = -dx * sin + dy * cos;
+        min_x = min_x.min(local_x);
+        min_y = min_y.min(local_y);
+        max_x = max_x.max(local_x);
+        max_y = max_y.max(local_y);
+    }
+    let width = max_x - min_x;
+    let height = max_y - min_y;
+    if foreground < 16 || width < 1.0 || height < 1.0 {
+        return rectangle_geometry(bbox);
+    }
+    let local_center_x = (min_x + max_x) * 0.5;
+    let local_center_y = (min_y + max_y) * 0.5;
     Geometry {
         origin: Origin::User,
         points: [
@@ -1337,8 +1375,8 @@ fn rotated_rectangle_geometry(
             (-width * 0.5, height * 0.5),
         ]
         .map(|(x, y)| Point {
-            x: center_x + x * cos - y * sin,
-            y: center_y + x * sin + y * cos,
+            x: (center_x + local_center_x) + x * cos - y * sin,
+            y: (center_y + local_center_y) + x * sin + y * cos,
         })
         .into(),
     }
@@ -1654,7 +1692,7 @@ mod tests {
         ImageSize, KoharuLayoutRFDetrSeg2XLConfig, MaskPixel, PageRegions, Processor, RegionOutput,
         StageInput, StageProcessor, color_palette, generation, infer_typography,
         link_dialogue_regions, mask_containment, mask_dilation_radius, mask_geometry,
-        normalize_text_color, stamp_mask, text_mask, write_region,
+        normalize_text_color, rotated_rectangle_geometry, stamp_mask, text_mask, write_region,
     };
 
     #[test]
@@ -2164,6 +2202,77 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A solid 200 x 30 bar tilted by 30 degrees, its axis-aligned box, and the
+    /// mask the model would hand over for it.
+    fn tilted_bar() -> (KoharuLayoutMask, [f32; 4]) {
+        const PAGE: u32 = 400;
+        let (length, thickness) = (200.0_f64, 30.0_f64);
+        let angle_degrees = 30.0_f64;
+        let (center_x, center_y) = (200.0_f64, 200.0_f64);
+        let (sin, cos) = angle_degrees.to_radians().sin_cos();
+        let mut pixels = vec![0; (PAGE * PAGE) as usize];
+        let (mut left, mut top, mut right, mut bottom) = (
+            f64::INFINITY,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NEG_INFINITY,
+        );
+        for y in 0..PAGE {
+            for x in 0..PAGE {
+                let (dx, dy) = (f64::from(x) + 0.5 - center_x, f64::from(y) + 0.5 - center_y);
+                let local_x = dx * cos + dy * sin;
+                let local_y = -dx * sin + dy * cos;
+                if local_x.abs() <= length * 0.5 && local_y.abs() <= thickness * 0.5 {
+                    pixels[(y * PAGE + x) as usize] = u8::MAX;
+                    left = left.min(f64::from(x));
+                    top = top.min(f64::from(y));
+                    right = right.max(f64::from(x) + 1.0);
+                    bottom = bottom.max(f64::from(y) + 1.0);
+                }
+            }
+        }
+        (
+            KoharuLayoutMask {
+                x: 0,
+                y: 0,
+                width: PAGE,
+                height: PAGE,
+                pixels,
+            },
+            [left as f32, top as f32, right as f32, bottom as f32],
+        )
+    }
+
+    /// The detection box is the bar's axis-aligned bounds, so rotating those
+    /// bounds by the bar's own angle would inflate the box by cos + sin; the
+    /// oriented box has to come from the mask pixels and land back on the
+    /// bar's real edges.
+    #[test]
+    fn tilted_text_gets_a_tight_oriented_box() {
+        let (mask, bbox) = tilted_bar();
+        let geometry = rotated_rectangle_geometry(&mask, bbox, 30.0);
+        let points = &geometry.points;
+        assert_eq!(points.len(), 4);
+        let side =
+            |a: usize, b: usize| (points[b].x - points[a].x).hypot(points[b].y - points[a].y);
+        let (length, thickness) = (side(0, 1), side(1, 2));
+        assert!(
+            (length - 200.0).abs() <= 200.0 * 0.05,
+            "the long side follows the bar: {length}"
+        );
+        assert!(
+            (thickness - 30.0).abs() <= 30.0 * 0.05,
+            "the short side follows the bar: {thickness}"
+        );
+        let angle = (points[1].y - points[0].y)
+            .atan2(points[1].x - points[0].x)
+            .to_degrees();
+        assert!(
+            (angle - 30.0).abs() <= 1.0,
+            "the box keeps the bar's tilt: {angle}"
+        );
     }
 
     #[test]
