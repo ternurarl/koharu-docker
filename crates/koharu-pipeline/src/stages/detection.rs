@@ -15,6 +15,7 @@ use imageproc::{
     contours::{BorderType, find_contours_with_threshold},
     distance_transform::{Norm, distance_transform},
     geometry::{approximate_polygon_dp, arc_length, contour_area},
+    morphology::dilate,
 };
 use koharu_ml::koharu_layout_rfdetr_seg_2xl::{
     KoharuLayoutDetection, KoharuLayoutDetections, KoharuLayoutMask, KoharuLayoutRFDetrSeg2XL,
@@ -41,7 +42,7 @@ const PRODUCER: &str = "dev.koharu.pipeline.detection";
 const ANGLE_SNAP_DEGREES: f32 = 3.0;
 const ANGLE_SEARCH_HALF_STEPS: i32 = 90;
 const ANGLE_SEARCH_STEP_DEGREES: f64 = 0.5;
-const TYPOGRAPHY_SAMPLE_MARGIN: f32 = 2.0;
+const TYPOGRAPHY_SAMPLE_MARGIN_PER_1024: f32 = 4.0;
 const COLOR_SNAP_DARK_LUMINANCE: u32 = 64 * 256;
 const COLOR_SNAP_LIGHT_LUMINANCE: u32 = 191 * 256;
 const COLOR_CLUSTER_MIN_DISTANCE_SQUARED: u32 = 32 * 32;
@@ -511,6 +512,15 @@ struct MaskPixel {
     inside_mask: bool,
 }
 
+/// How far outside a detection's box the typography sample reaches, 4 pixels
+/// per 1024 of the page's longer side. Lettering is drawn at a size set by the
+/// page's resolution, so its outline and glow scale with it too: a fixed 2
+/// pixels of margin on a poster-sized page samples that outline, and the ring
+/// judged as background is then the lettering's own edge.
+fn typography_sample_margin(width: u32, height: u32) -> f32 {
+    ((width.max(height) as f32 / 1024.0) * TYPOGRAPHY_SAMPLE_MARGIN_PER_1024).clamp(3.0, 32.0)
+}
+
 // BallonsTranslator normalizes vertical-line angles relative to upright text:
 // https://github.com/dmMaze/BallonsTranslator/blob/4bcc635c19f6c63a902872cf77b3d554e14ed1b7/ballontranslator/utils/textblock.py#L576-L608
 // RF-DETR provides foreground pixels rather than line quadrilaterals, so
@@ -525,19 +535,22 @@ fn infer_typography(
     let width = image.width();
     let height = image.height();
     let [bbox_left, bbox_top, bbox_right, bbox_bottom] = detection.bbox;
+    // One margin for both the sampled window and its background ring, so the
+    // ring never overlaps the block the colours are judged on.
+    let margin = typography_sample_margin(width, height);
     let [left, top, right, bottom] = mask_window(
         [
-            bbox_left - TYPOGRAPHY_SAMPLE_MARGIN,
-            bbox_top - TYPOGRAPHY_SAMPLE_MARGIN,
-            bbox_right + TYPOGRAPHY_SAMPLE_MARGIN,
-            bbox_bottom + TYPOGRAPHY_SAMPLE_MARGIN,
+            bbox_left - margin,
+            bbox_top - margin,
+            bbox_right + margin,
+            bbox_bottom + margin,
         ],
         width,
         height,
     )?;
     let local_width = right - left + 2;
     let local_height = bottom - top + 2;
-    let background_margin = TYPOGRAPHY_SAMPLE_MARGIN.ceil() as u32;
+    let background_margin = margin.ceil() as u32;
     let mut points = Vec::new();
     let mut pixels = Vec::new();
     let mut background = Vec::new();
@@ -1364,9 +1377,9 @@ fn mask_geometry(mask: &KoharuLayoutMask) -> Option<Geometry> {
 }
 
 /// The page's text mask: each text detection's mask fitted to its glyphs, so
-/// inpainting redraws the lettering and not the paper or art between it.
-/// Onomatopoeia keeps out of it, as a drawn mark of its own is redrawn with
-/// the art.
+/// inpainting redraws the lettering and not the paper or art between it, then
+/// grown past the glyphs' own edge. Onomatopoeia keeps out of it, as a drawn
+/// mark of its own is redrawn with the art.
 fn text_mask(detections: &[KoharuLayoutDetection], image: &RgbImage, size: ImageSize) -> GrayImage {
     let mut mask = GrayImage::new(size.width, size.height);
     for detection in detections
@@ -1380,7 +1393,25 @@ fn text_mask(detections: &[KoharuLayoutDetection], image: &RgbImage, size: Image
             0,
         );
     }
-    mask
+    if mask.width() == 0 || mask.height() == 0 {
+        return mask;
+    }
+    dilate(
+        &mask,
+        Norm::L2,
+        mask_dilation_radius(size.width, size.height),
+    )
+}
+
+/// The text mask's growth past the glyphs, 6 pixels per 1024 of the page's
+/// longer side. A mask edge that stops at the glyph hands the inpainter the
+/// lettering's own outline or halo as the boundary, and it repaints the covered
+/// strokes in that colour, leaving a ghost; the edge has to land on the paper
+/// or art around the lettering instead.
+fn mask_dilation_radius(width: u32, height: u32) -> u8 {
+    ((width.max(height) as f32 / 1024.0) * 6.0)
+        .round()
+        .clamp(1.0, 255.0) as u8
 }
 
 async fn write_masks(
@@ -1584,8 +1615,10 @@ fn mask_containment(
 
 #[cfg(test)]
 mod tests {
-    use image::{Rgb, RgbImage};
-    use koharu_ml::koharu_layout_rfdetr_seg_2xl::{KoharuLayoutDetection, KoharuLayoutMask};
+    use image::{GrayImage, Rgb, RgbImage};
+    use koharu_ml::koharu_layout_rfdetr_seg_2xl::{
+        KoharuLayoutDetection, KoharuLayoutMask, glyph_mask,
+    };
     use koharu_scene::{
         At, BubbleRegion, FitsTo, FlowsIn, Geometry, Inside, Origin, PageDraft, Session,
         TextLayout, TextLayoutKind, TextRegion, Typography, WritingMode,
@@ -1595,8 +1628,8 @@ mod tests {
         DIALOGUE_MASK_CONTAINMENT_THRESHOLD, DetectedRegion, DetectedText, DetectionModel,
         ImageSize, KoharuLayoutRFDetrSeg2XLConfig, MaskPixel, PageRegions, Processor, RegionOutput,
         StageInput, StageProcessor, color_palette, generation, infer_typography,
-        link_dialogue_regions, mask_containment, mask_geometry, normalize_text_color, text_mask,
-        write_region,
+        link_dialogue_regions, mask_containment, mask_dilation_radius, mask_geometry,
+        normalize_text_color, stamp_mask, text_mask, write_region,
     };
 
     #[test]
@@ -1996,6 +2029,116 @@ mod tests {
         assert_eq!(typography.color, Some([0, 0, 0, 255]));
         assert_eq!(typography.stroke_color, Some([255, 255, 255, 255]));
         assert_eq!(typography.stroke_width, Some(3.0));
+    }
+
+    /// A white glyph on skin, outlined in dark, with the detection's mask
+    /// covering only the glyph.
+    fn outlined_glyph() -> (RgbImage, KoharuLayoutDetection) {
+        let (width, height) = (200, 200);
+        let outline_width = 6;
+        let [left, top, right, bottom] = [80, 80, 120, 120];
+        let margin = 2;
+        let mut image = RgbImage::from_pixel(width, height, Rgb([245, 200, 180]));
+        for y in top - outline_width..bottom + outline_width {
+            for x in left - outline_width..right + outline_width {
+                let glyph = (left..right).contains(&x) && (top..bottom).contains(&y);
+                image.put_pixel(
+                    x,
+                    y,
+                    if glyph {
+                        Rgb([255, 255, 255])
+                    } else {
+                        Rgb([40, 32, 30])
+                    },
+                );
+            }
+        }
+        let mut pixels = vec![0; (width * height) as usize];
+        for y in top - margin..bottom + margin {
+            for x in left - margin..right + margin {
+                pixels[(y * width + x) as usize] = u8::MAX;
+            }
+        }
+        (
+            image,
+            KoharuLayoutDetection {
+                label_id: 0,
+                label: "text".to_owned(),
+                score: 1.0,
+                bbox: [left as f32, top as f32, right as f32, bottom as f32],
+                area: pixels.iter().filter(|value| **value != 0).count() as u32,
+                mask: KoharuLayoutMask {
+                    x: 0,
+                    y: 0,
+                    width,
+                    height,
+                    pixels,
+                },
+            },
+        )
+    }
+
+    #[test]
+    fn text_mask_grows_past_the_glyph_into_the_outline() {
+        let (image, detection) = outlined_glyph();
+        let size = ImageSize {
+            width: 200,
+            height: 200,
+        };
+        let radius = mask_dilation_radius(size.width, size.height);
+        let fitted = glyph_mask(&detection.mask, detection.bbox, &image);
+        let mut fitted_page = GrayImage::new(size.width, size.height);
+        stamp_mask(&mut fitted_page, &fitted, 0, 0);
+
+        let mask = text_mask(std::slice::from_ref(&detection), &image, size);
+
+        assert_eq!(
+            mask.get_pixel(100, 100).0[0],
+            u8::MAX,
+            "the glyph's own pixels stay masked"
+        );
+        // Two scans through the glyph's middle, one across and one down, each
+        // ending `radius` pixels further out than the mask fitted to the glyph.
+        let extent = |image: &GrayImage, across: bool| {
+            let scan = if across {
+                image.width()
+            } else {
+                image.height()
+            };
+            let covered = (0..scan)
+                .filter(|step| {
+                    let (x, y) = if across { (*step, 100) } else { (100, *step) };
+                    image.get_pixel(x, y).0[0] != 0
+                })
+                .collect::<Vec<_>>();
+            let first = covered.first().copied().expect("the glyph is masked");
+            let last = covered.last().copied().expect("the glyph is masked");
+            (first, last)
+        };
+        for across in [true, false] {
+            let (fitted_first, fitted_last) = extent(&fitted_page, across);
+            let (first, last) = extent(&mask, across);
+            let axis = if across { "across" } else { "down" };
+            assert_eq!(
+                first,
+                fitted_first - u32::from(radius),
+                "the mask stops at the glyph on the {axis} side"
+            );
+            assert_eq!(
+                last,
+                fitted_last + u32::from(radius),
+                "the mask stops at the glyph on the {axis} side"
+            );
+        }
+        for y in 0..20 {
+            for x in 0..20 {
+                assert_eq!(
+                    mask.get_pixel(x, y).0[0],
+                    0,
+                    "the mask stays around the glyph at ({x}, {y})"
+                );
+            }
+        }
     }
 
     #[test]
