@@ -1464,15 +1464,20 @@ fn grown_mask(mask: &KoharuLayoutMask, radius: u8, size: ImageSize) -> KoharuLay
 }
 
 /// One detection's text-mask growth: a quarter of the block's shorter side,
-/// never more than 6 pixels per 1024 of the page's longer side. Manga
+/// never more than 10 pixels per 1024 of the page's longer side. Manga
 /// Translator UI's `mask_refinement/text_mask_utils.py` sizes this growth from
 /// the line's glyph size, so small lettering keeps the art around it while a
 /// big sound effect still grows wide; this repository only has block-level
 /// boxes, so the box's shorter side stands in for the glyph size. A mask edge
 /// that stops at the glyph hands the inpainter the lettering's own outline or
-/// halo as the boundary, and it repaints the covered strokes in that colour.
+/// casing as the boundary, and it repaints the covered strokes in that colour.
+/// The casing is what sets the page term: black lettering drawn on a white
+/// sticker casing measures 16 pixels thick at the median and 82 at the widest
+/// on a 2048-pixel page, so the growth has to pass that median for the edge to
+/// land on the art; the quarter-of-the-short-side bound still keeps small
+/// blocks from erasing the art around them.
 fn mask_dilation_radius(bbox: [f32; 4], size: ImageSize) -> u8 {
-    let page = ((size.width.max(size.height) as f32 / 1024.0) * 6.0).round();
+    let page = ((size.width.max(size.height) as f32 / 1024.0) * 10.0).round();
     let short_side = (bbox[2] - bbox[0]).min(bbox[3] - bbox[1]).max(1.0);
     page.min((short_side * 0.25).round()).clamp(1.0, 32.0) as u8
 }
