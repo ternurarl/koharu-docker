@@ -18,6 +18,10 @@ use crate::{
     script::is_chinese_or_japanese_text,
 };
 
+/// How wide a stroke may get relative to the type size it outlines. A stroke is
+/// painted at twice its width, so this keeps the painted band at 40% of a glyph.
+const MAX_STROKE_RATIO: f32 = 0.2;
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct TextNodeDescriptor {
     pub(crate) entity: koharu_scene::EntityId,
@@ -246,13 +250,28 @@ impl TextRenderer {
         y += layout.placement_offset_y();
         let transform = Affine::translate((f64::from(x), f64::from(y)));
         let color = descriptor.foreground_color;
+        // The detection stage measures a stroke in page pixels, which means
+        // nothing until the layout has chosen a type size: it cannot see the
+        // fitted size, so a plausible measurement can arrive far too wide for
+        // the glyphs it outlines and paint neighbouring strokes into one solid
+        // block. Cap it here, where the size is known, and use the capped value
+        // for both the paint and the bounds so the two cannot disagree. The
+        // insets keep the measured width: a generous inset only shrinks the
+        // layout area, which is the safe direction.
+        let stroke = descriptor.stroke.map(|stroke| StrokeOptions {
+            color: stroke.color,
+            width_px: stroke
+                .width_px
+                .max(0.0)
+                .min(layout.font_size * MAX_STROKE_RATIO),
+        });
         let mut options = TextRenderOptions {
             color,
             stroke: None,
             ..TextRenderOptions::default()
         };
         let mut scene = Scene::new();
-        if let Some(stroke) = descriptor.stroke {
+        if let Some(stroke) = stroke {
             options.stroke = Some(stroke);
         }
         self.render(
@@ -285,9 +304,7 @@ impl TextRenderer {
             width: layout.width,
             height: layout.height,
         };
-        let stroke_padding = descriptor
-            .stroke
-            .map_or(0.0, |stroke| stroke.width_px.max(0.0));
+        let stroke_padding = stroke.map_or(0.0, |stroke| stroke.width_px.max(0.0));
         Ok(RenderedTextNode {
             scene: Arc::new(scene),
             local_bounds: RenderBounds {
@@ -582,6 +599,92 @@ mod tests {
                 }
             ),
             [1.0; 4]
+        );
+    }
+
+    /// A page-sized vertical fit region holding twenty characters, the shape a
+    /// detected block of Japanese becomes once it is translated.
+    fn fitted_block(stroke_width: f32, family: String) -> TextNodeDescriptor {
+        TextNodeDescriptor {
+            text: "这一块文字用来检查描边宽度会不会把整块糊成实心".to_owned(),
+            width: 285.0,
+            height: 344.0,
+            preferred_font: Some(family.clone()),
+            font_families: vec![family],
+            font_size: None,
+            writing_mode: WritingMode::VerticalRl,
+            auto_fit: true,
+            is_fit_region: true,
+            text_inset: [4.0; 4],
+            stroke: Some(StrokeOptions {
+                color: [187, 97, 71, 255],
+                width_px: stroke_width,
+            }),
+            ..descriptor()
+        }
+    }
+
+    /// The one font these cases shape with, loaded before shaping.
+    async fn prepared_family() -> (String, Fonts) {
+        let family = crate::fonts::FontSystem::new()
+            .first_font()
+            .expect("a system font")
+            .family_name()
+            .to_owned();
+        let fonts = Fonts::new();
+        fonts
+            .prepare(&[crate::fonts::FontRequest {
+                family: family.clone(),
+                weight: None,
+                style: None,
+            }])
+            .await
+            .expect("the font loads");
+        (family, fonts)
+    }
+
+    /// The distance the painted stroke adds on each side of the laid-out glyphs.
+    fn stroke_bleed(node: &RenderedTextNode) -> f32 {
+        node.metadata.rendered_bounds.x - node.local_bounds.x
+    }
+
+    #[tokio::test]
+    async fn oversized_stroke_is_clamped_to_the_fitted_size() {
+        let (family, fonts) = prepared_family().await;
+        let descriptor = fitted_block(34.0, family);
+        let node = TextRenderer::new()
+            .render_descriptor(&descriptor, &fonts)
+            .expect("the block lays out");
+
+        let font_size = node.metadata.font_size;
+        let bleed = stroke_bleed(&node);
+        assert!(
+            bleed <= font_size * MAX_STROKE_RATIO + 0.01,
+            "a {font_size}-pixel glyph cannot carry a {} pixel stroke, bled {bleed}",
+            descriptor.stroke.expect("a stroke").width_px
+        );
+        let bounds = node.local_bounds;
+        assert!(
+            bounds.x >= -0.01
+                && bounds.y >= -0.01
+                && bounds.x + bounds.width <= descriptor.width + 0.01
+                && bounds.y + bounds.height <= descriptor.height + 0.01,
+            "the stroked block stays inside its frame: {bounds:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn normal_stroke_is_left_alone() {
+        let (family, fonts) = prepared_family().await;
+        let descriptor = fitted_block(6.0, family);
+        let node = TextRenderer::new()
+            .render_descriptor(&descriptor, &fonts)
+            .expect("the block lays out");
+
+        let bleed = stroke_bleed(&node);
+        assert!(
+            (bleed - 6.0).abs() <= 0.01,
+            "a normal stroke keeps its paint width, bled {bleed}"
         );
     }
 }
