@@ -24,6 +24,21 @@
 # translation works out of the box. The default CMD enables the iGPU mode
 # (--gpu), so pass --device /dev/dri to expose the Intel ANV Vulkan driver to
 # stable-diffusion.cpp inpainting.
+#
+# Memory allocator: the runtime preloads jemalloc instead of relying on glibc
+# malloc. Torch and the detection models allocate and free tensors of
+# megabytes per page from several threads, and glibc malloc returns those to
+# the kernel through per-thread arenas it grows but rarely trims, which shows up
+# as a resident set that keeps climbing across pages; jemalloc reuses freed
+# size classes instead.
+#
+# OpenMP: torch's intra-op pool defaults to one spinning thread per core and
+# keeps spinning between calls. OMP_WAIT_POLICY=PASSIVE parks those threads
+# once a kernel finishes, so the cores are free for the Rayon parallel work
+# (mask resampling, cropping) that runs between Torch calls; OMP_PROC_BIND=CLOSE
+# keeps each worker on one core rather than migrating. Torch's intra-op thread
+# count is set at start-up from KOHARU_TORCH_THREADS (falling back to
+# OMP_NUM_THREADS) in crates/koharu-ml/src/lib.rs.
 
 FROM ubuntu:24.04 AS builder
 ARG DEBIAN_FRONTEND=noninteractive
@@ -53,6 +68,14 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --pr
 WORKDIR /app
 COPY . .
 
+# target-cpu=x86-64-v3 is the baseline every supported x86-64 host CPU meets
+# (AVX2, BMI2, FMA) and it is what Torch's own x86-64 wheels assume, so the
+# compiler's autovectorized Rust code matches the SIMD width the native
+# operators already use. Override it for a narrower target: --build-arg
+# RUSTFLAGS="-C target-cpu=x86-64".
+ARG RUSTFLAGS="-C target-cpu=x86-64-v3"
+ENV RUSTFLAGS=${RUSTFLAGS}
+
 # Frontend build is intentionally skipped: the headless feature does not
 # embed a frontend (no tauri-build / generate_context!).
 
@@ -74,13 +97,18 @@ ARG DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates curl libssl3 libgomp1 libfontconfig1 fonts-noto-cjk \
-        mesa-vulkan-drivers libvulkan1 \
+        mesa-vulkan-drivers libvulkan1 libjemalloc2 \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --create-home --shell /bin/bash koharu \
     && install -d -o koharu -g koharu -m 755 /home/koharu/.local/share/Koharu
 
 COPY --from=builder /out/koharu /usr/local/bin/koharu
 COPY --from=builder /out/pipeline-task /usr/local/bin/pipeline-task
+
+# jemalloc and the OpenMP wait policy are explained in the header comment.
+ENV LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libjemalloc.so.2 \
+    OMP_PROC_BIND=CLOSE \
+    OMP_WAIT_POLICY=PASSIVE
 
 USER koharu
 WORKDIR /home/koharu
