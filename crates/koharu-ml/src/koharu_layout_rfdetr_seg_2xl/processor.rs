@@ -10,26 +10,32 @@ use serde::Serialize;
 
 use super::{
     config::{KoharuLayoutRFDetrSeg2XLConfig, KoharuLayoutThresholds},
-    model::Output,
+    model::{CHECKPOINT_RESOLUTION, Output},
+    resolution::ResolutionPolicy,
 };
 
 #[derive(Debug, Clone)]
 pub struct KoharuLayoutRFDetrImageProcessor {
-    resolution: i64,
+    policy: ResolutionPolicy,
     num_select: i64,
     class_names: Vec<String>,
 }
 
 impl KoharuLayoutRFDetrImageProcessor {
     pub fn new(config: &KoharuLayoutRFDetrSeg2XLConfig) -> Result<Self> {
-        ensure!(config.resolution > 0, "RF-DETR resolution must be positive");
+        // The positional embedding table and the mask stride are built for
+        // `CHECKPOINT_RESOLUTION`, so a checkpoint whose own resolution differs
+        // cannot run on this port. `new` is the public entry to the processor,
+        // which makes it the owner of this check; `mod.rs` only adds context.
         ensure!(
-            config.resolution % 24 == 0,
-            "RF-DETR resolution must be divisible by patch_size * num_windows"
+            config.resolution == CHECKPOINT_RESOLUTION,
+            "the checkpoint's {}-pixel resolution does not match this port's {}",
+            config.resolution,
+            CHECKPOINT_RESOLUTION
         );
         ensure!(config.num_select > 0, "RF-DETR num_select must be positive");
         Ok(Self {
-            resolution: config.resolution,
+            policy: ResolutionPolicy::from_env()?,
             num_select: config.num_select,
             class_names: config.class_names(),
         })
@@ -41,22 +47,20 @@ impl KoharuLayoutRFDetrImageProcessor {
             "cannot segment an empty image"
         );
         let image = image.to_rgb8();
+        let (target_h, target_w) = self.policy.target_size(image.width(), image.height());
         let mut pixel_values = Tensor::from_slice(image.as_raw())
             .view([1, i64::from(image.height()), i64::from(image.width()), 3])
             .permute([0, 3, 1, 2])
             .to_device(device)
             .to_kind(Kind::Float)
             / 255.0;
-        if image.width() != self.resolution as u32 || image.height() != self.resolution as u32 {
+        if i64::from(image.width()) != target_w || i64::from(image.height()) != target_h {
             // Latest upstream disables antialiasing to match the bilinear
             // Albumentations resize used during training.
-            pixel_values = pixel_values.upsample_bilinear2d(
-                [self.resolution, self.resolution],
-                false,
-                None,
-                None,
-            );
+            pixel_values =
+                pixel_values.upsample_bilinear2d([target_h, target_w], false, None, None);
         }
+        tracing::debug!(target_h, target_w, "RF-DETR input resolution");
         let mean = Tensor::from_slice(&[0.485f32, 0.456, 0.406])
             .view([1, 3, 1, 1])
             .to_device(device);
@@ -84,14 +88,10 @@ impl KoharuLayoutRFDetrImageProcessor {
             "unexpected RF-DETR box shape {:?}",
             output.pred_boxes.size()
         );
-        // The segmentation head projects at a quarter of the input, as
-        // upstream 15914d76: 480 for the HighRes checkpoint's 1920.
-        let mask_size = self.resolution / 4;
-        ensure!(
-            output.pred_masks.size() == [1, 300, mask_size, mask_size],
-            "unexpected RF-DETR mask shape {:?}",
-            output.pred_masks.size()
-        );
+        // The segmentation head projects at a quarter of the input it was fed,
+        // so the expected mask shape follows from the same policy that sized
+        // the input; `target_size` is pure, so the page size is enough.
+        let (target_h, target_w) = self.policy.target_size(image_width, image_height);
 
         // PostProcess ranks every query/class pair, including the checkpoint's
         // fifth background logit slot, before applying the caller threshold.
@@ -134,24 +134,42 @@ impl KoharuLayoutRFDetrImageProcessor {
             ])
             .to_device(output.pred_boxes.device());
 
-        // Gathering before interpolation is output-equivalent to upstream and
-        // avoids allocating resized masks for candidates rejected by threshold.
-        let masks = output.pred_masks.i(0).index_select(0, &query_indexes);
-
         let floats = Tensor::cat(&[scores.unsqueeze(1), boxes], 1);
         let floats = tensor_to_vec_f32(&floats)?;
         let labels = tensor_to_vec_i64(&labels)?;
         let queries = tensor_to_vec_i64(&query_indexes)?;
 
         let kept = one_label_per_query(&queries, &labels);
+        // `kept` holds positions in the thresholded selection, while the mask
+        // projection indexes the checkpoint's 300 queries, so the positions are
+        // mapped through `query_indexes` first. Only the kept queries are ever
+        // projected: each mask row is its own sum over the hidden dimension, so
+        // these are the same rows a full 300-query product would produce. This
+        // is the zero-loss form of upstream's project-everything-then-drop, not
+        // an approximation of it.
+        let kept_positions = Tensor::from_slice(
+            &kept
+                .iter()
+                .map(|&position| position as i64)
+                .collect::<Vec<_>>(),
+        )
+        .to_device(output.pred_logits.device());
+        let kept_queries = query_indexes.index_select(0, &kept_positions);
+        let projected = output.masks.select(&kept_queries);
+        ensure!(
+            projected.size() == [kept.len() as i64, target_h / 4, target_w / 4],
+            "unexpected RF-DETR mask shape {:?}",
+            projected.size()
+        );
+
         let mut detections = Vec::with_capacity(kept.len());
-        for index in kept {
+        for (kept_row, index) in kept.into_iter().enumerate() {
             // RF-DETR defines masks by bilinearly projecting each native mask to
             // the source image and thresholding at zero. Resolve one mask at a
             // time to preserve that exact contract without retaining an
             // N-by-page tensor, then keep only its non-zero page-space extent.
-            let mask = masks
-                .i(index as i64)
+            let mask = projected
+                .i(kept_row as i64)
                 .unsqueeze(0)
                 .unsqueeze(0)
                 .upsample_bilinear2d(

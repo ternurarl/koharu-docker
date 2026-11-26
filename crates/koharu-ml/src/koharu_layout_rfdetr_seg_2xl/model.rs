@@ -12,9 +12,28 @@ use koharu_torch::{
     nn::{self, Module},
 };
 
-pub(super) const RESOLUTION: i64 = 1920;
+/// The square input side the checkpoint was trained and exported at. The
+/// positional embedding table is registered on this grid, and `mod.rs` checks
+/// the checkpoint config against it.
+pub(super) const CHECKPOINT_RESOLUTION: i64 = 1920;
+
+/// Both network sides must be a multiple of this: the backbone splits the
+/// patch grid into `NUM_WINDOWS²` windows and the segmentation head projects at
+/// a quarter of the input, so the patch size times the window count bounds
+/// every later division.
+pub(super) const RESOLUTION_MULTIPLE: i64 = PATCH_SIZE * NUM_WINDOWS;
+
 const PATCH_SIZE: i64 = 12;
 const NUM_WINDOWS: i64 = 2;
+/// Interpolated positional embeddings kept per input size. Pages of different
+/// aspect ratios resolve to different sizes, so only repeated pages and
+/// same-size batches hit the cache; once it holds this many sizes it is dropped
+/// whole rather than evicted one by one.
+const POS_EMBED_CACHE_ENTRIES: usize = 8;
+/// Encoder proposal grids kept per `Transformer`, dropped whole when full, like
+/// the positional embedding cache: a page of a different size resolves to a
+/// different grid.
+const PROPOSALS_CACHE_ENTRIES: usize = 8;
 const DINO_DIM: i64 = 384;
 const DINO_HEADS: i64 = 6;
 const HIDDEN_DIM: i64 = 256;
@@ -27,7 +46,46 @@ const DECODER_LAYERS: usize = 6;
 pub(super) struct Output {
     pub pred_logits: Tensor,
     pub pred_boxes: Tensor,
-    pub pred_masks: Tensor,
+    /// The mask projection inputs; the product itself is taken per kept query
+    /// in the processor, see [`MaskFeatures::select`].
+    pub masks: MaskFeatures,
+}
+
+/// What the segmentation head has to keep for the mask product.
+///
+/// Upstream multiplies every query against the spatial features and then drops
+/// the rows its postprocessing rejects, which at 1920 writes a 300×480×480
+/// tensor (276 MB) to keep at most a few dozen rows. Only the processor knows
+/// which queries survive thresholding, so the head stops one step earlier and
+/// hands these three tensors over.
+#[derive(Debug)]
+pub(super) struct MaskFeatures {
+    /// `[1, HIDDEN_DIM, mask_h, mask_w]`, the projected spatial features.
+    spatial: Tensor,
+    /// `[1, NUM_QUERIES, HIDDEN_DIM]`, the projected decoder queries.
+    query: Tensor,
+    /// `[1]`, the head's learned mask bias.
+    bias: Tensor,
+}
+
+impl MaskFeatures {
+    /// Projects the masks of `queries` only, returning `[K, mask_h, mask_w]`.
+    ///
+    /// Each row of the mask product is its own sum over `HIDDEN_DIM`, so
+    /// projecting the kept queries gives exactly the rows a full 300-query
+    /// product would give for those queries: this is a zero-loss change, not an
+    /// approximation.
+    pub(super) fn select(&self, queries: &Tensor) -> Tensor {
+        let mask_h = self.spatial.size()[2];
+        let mask_w = self.spatial.size()[3];
+        let kept = queries.size()[0];
+        self.query
+            .i(0)
+            .index_select(0, queries)
+            .matmul(&self.spatial.i(0).flatten(1, -1))
+            .view([kept, mask_h, mask_w])
+            + &self.bias
+    }
 }
 
 #[derive(Debug)]
@@ -90,15 +148,11 @@ impl Model {
     }
 
     pub fn forward(&self, pixel_values: &Tensor) -> Output {
+        let input_size = pixel_values.size();
         let pixel_values = pixel_values.to_kind(self.var_store.kind());
         let features = self.backbone.forward(&pixel_values);
-        let position_embeddings = features
-            .iter()
-            .map(sine_position_embedding)
-            .collect::<Vec<_>>();
         let transformer_output = self.transformer.forward(
             &features,
-            &position_embeddings,
             &self.refpoint_embed.ws.i(0..NUM_QUERIES),
             &self.query_feat.ws.i(0..NUM_QUERIES),
         );
@@ -108,21 +162,22 @@ impl Model {
         let delta = self.bbox_embed.forward(&hs);
         let pred_boxes = Tensor::cat(
             &[
-                delta.i((.., .., .., 0..2)) * reference.i((.., .., .., 2..4))
-                    + reference.i((.., .., .., 0..2)),
-                delta.i((.., .., .., 2..4)).exp() * reference.i((.., .., .., 2..4)),
+                delta.i((.., .., 0..2)) * reference.i((.., .., 2..4)) + reference.i((.., .., 0..2)),
+                delta.i((.., .., 2..4)).exp() * reference.i((.., .., 2..4)),
             ],
             -1,
-        )
-        .i(-1);
-        let pred_logits = self.class_embed.forward(&hs).i(-1);
-        let pred_masks =
+        );
+        let pred_logits = self.class_embed.forward(&hs);
+        // The segmentation head projects to a quarter of whatever the
+        // backbone consumed, so it takes the actual input size rather than the
+        // checkpoint's.
+        let masks =
             self.segmentation_head
-                .forward(&features[0], &hs.i(-1), (RESOLUTION, RESOLUTION));
+                .features(&features[0], &hs, (input_size[2], input_size[3]));
         Output {
             pred_logits,
             pred_boxes,
-            pred_masks,
+            masks,
         }
     }
 }
@@ -218,6 +273,9 @@ struct DinoEmbeddings {
     _mask_token: Tensor,
     position_embeddings: Tensor,
     projection: nn::Conv2D,
+    /// `forward` takes `&self`, and the interpolated table depends only on the
+    /// input size, so the cache is the only interior mutability needed here.
+    pos_embed_cache: std::sync::Mutex<std::collections::HashMap<(i64, i64), Tensor>>,
 }
 
 impl DinoEmbeddings {
@@ -227,7 +285,7 @@ impl DinoEmbeddings {
             _mask_token: path.var("mask_token", &[1, DINO_DIM], nn::Init::Const(0.0)),
             position_embeddings: path.var(
                 "position_embeddings",
-                &[1, (RESOLUTION / PATCH_SIZE).pow(2) + 1, DINO_DIM],
+                &[1, (CHECKPOINT_RESOLUTION / PATCH_SIZE).pow(2) + 1, DINO_DIM],
                 nn::Init::Const(0.0),
             ),
             projection: nn::conv2d(
@@ -240,13 +298,70 @@ impl DinoEmbeddings {
                     ..Default::default()
                 },
             ),
+            pos_embed_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
+    }
+
+    /// The positional embedding table resized to a `target_h`×`target_w` input.
+    ///
+    /// Follows upstream `make_new_interpolated_pos_encoding`
+    /// (roboflow/rf-detr@4ab7c18 src/rfdetr/models/backbone/dinov2.py:215-244):
+    /// the patch part is viewed on its native square grid, bicubically resized
+    /// to the target token grid, and concatenated behind the class-token entry.
+    ///
+    /// Divergence: upstream resizes with `antialias=True`, but the wrapper this
+    /// crate builds on only exports `upsample_bicubic2d`
+    /// (crates/koharu-torch/src/wrappers/tensor_generated.rs:19549), so this
+    /// resize is not antialiased. That can change numbers only when a target
+    /// side carries fewer tokens than the checkpoint's 160, which the
+    /// `balanced` and `fast` budgets do, and only for this smooth table.
+    fn interpolate_pos_embed(&self, target_h: i64, target_w: i64) -> Tensor {
+        if (target_h, target_w) == (CHECKPOINT_RESOLUTION, CHECKPOINT_RESOLUTION) {
+            return self.position_embeddings.shallow_clone();
+        }
+        let key = (target_h, target_w);
+        if let Ok(cache) = self.pos_embed_cache.lock()
+            && let Some(cached) = cache.get(&key)
+        {
+            return cached.shallow_clone();
+        }
+        let grid = CHECKPOINT_RESOLUTION / PATCH_SIZE;
+        let class_pos_embed = self.position_embeddings.i((.., ..1));
+        let patch_pos_embed = self
+            .position_embeddings
+            .i((.., 1..))
+            .reshape([1, grid, grid, DINO_DIM])
+            .permute([0, 3, 1, 2])
+            .to_kind(Kind::Float)
+            .upsample_bicubic2d(
+                [target_h / PATCH_SIZE, target_w / PATCH_SIZE],
+                false,
+                None,
+                None,
+            )
+            .permute([0, 2, 3, 1])
+            .reshape([1, -1, DINO_DIM])
+            .to_kind(self.position_embeddings.kind());
+        let pos_embed = Tensor::cat(&[class_pos_embed, patch_pos_embed], 1).contiguous();
+        if let Ok(mut cache) = self.pos_embed_cache.lock() {
+            if cache.len() >= POS_EMBED_CACHE_ENTRIES {
+                cache.clear();
+            }
+            cache.insert(key, pos_embed.shallow_clone());
+        }
+        pos_embed
     }
 
     fn forward(&self, pixel_values: &Tensor) -> Tensor {
         let size = pixel_values.size();
-        assert_eq!(size[2], RESOLUTION);
-        assert_eq!(size[3], RESOLUTION);
+        // Upstream accepts rectangular inputs whose sides both divide by the
+        // patch grid of one window (dinov2.py:271-277).
+        assert!(
+            size[2] % RESOLUTION_MULTIPLE == 0 && size[3] % RESOLUTION_MULTIPLE == 0,
+            "RF-DETR input sides must divide by {RESOLUTION_MULTIPLE}, got {}x{}",
+            size[2],
+            size[3]
+        );
         let batch_size = size[0];
         let embeddings = self
             .projection
@@ -259,10 +374,10 @@ impl DinoEmbeddings {
                 embeddings,
             ],
             1,
-        ) + &self.position_embeddings;
+        ) + self.interpolate_pos_embed(size[2], size[3]);
 
-        let height = RESOLUTION / PATCH_SIZE;
-        let width = RESOLUTION / PATCH_SIZE;
+        let height = size[2] / PATCH_SIZE;
+        let width = size[3] / PATCH_SIZE;
         let height_per_window = height / NUM_WINDOWS;
         let width_per_window = width / NUM_WINDOWS;
         let cls = embeddings.i((.., ..1)).repeat([NUM_WINDOWS.pow(2), 1, 1]);
@@ -577,11 +692,20 @@ impl ChannelLayerNorm {
 struct Transformer {
     decoder: TransformerDecoder,
     encoder_groups: Vec<EncoderGroup>,
+    /// The encoder's proposals depend only on the memory grid and on its kind
+    /// and device, so a page whose grid was already solved reuses them. The key
+    /// carries all four: a tensor built for one kind or device cannot be used
+    /// by another.
+    proposals_cache: std::sync::Mutex<
+        std::collections::HashMap<(i64, i64, i64, Kind, Device), (Tensor, Tensor)>,
+    >,
 }
 
 #[derive(Debug)]
 struct TransformerOutput {
+    /// `[1, NUM_QUERIES, HIDDEN_DIM]`, the last decoder layer's output.
     hs: Tensor,
+    /// `[1, NUM_QUERIES, 4]`, normalized center/size reference boxes.
     references: Tensor,
 }
 
@@ -592,13 +716,43 @@ impl Transformer {
             encoder_groups: (0..GROUP_DETR)
                 .map(|index| EncoderGroup::new(path, index))
                 .collect(),
+            proposals_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
+    }
+
+    /// The encoder proposals and their validity mask for one memory grid.
+    ///
+    /// Upstream rebuilds the `meshgrid` and the `[0.01, 0.99]` mask on every
+    /// call, and both depend only on the grid shape, kind and device. The two
+    /// tensors come back by `shallow_clone`, so callers must not write into
+    /// them: `forward` only reads them and writes the masked copies it needs.
+    fn encoder_proposals(
+        &self,
+        batch: i64,
+        height: i64,
+        width: i64,
+        kind: Kind,
+        device: Device,
+    ) -> (Tensor, Tensor) {
+        let key = (batch, height, width, kind, device);
+        if let Ok(cache) = self.proposals_cache.lock()
+            && let Some((proposals, valid)) = cache.get(&key)
+        {
+            return (proposals.shallow_clone(), valid.shallow_clone());
+        }
+        let (proposals, valid) = build_encoder_proposals(batch, height, width, kind, device);
+        if let Ok(mut cache) = self.proposals_cache.lock() {
+            if cache.len() >= PROPOSALS_CACHE_ENTRIES {
+                cache.clear();
+            }
+            cache.insert(key, (proposals.shallow_clone(), valid.shallow_clone()));
+        }
+        (proposals, valid)
     }
 
     fn forward(
         &self,
         features: &[Tensor],
-        position_embeddings: &[Tensor],
         refpoint_embed: &Tensor,
         query_feat: &Tensor,
     ) -> TransformerOutput {
@@ -607,9 +761,15 @@ impl Transformer {
         let height = feature_size[2];
         let width = feature_size[3];
         let memory = features[0].flatten(2, -1).transpose(1, 2);
-        let position = position_embeddings[0].flatten(2, -1).transpose(1, 2);
-        let (output_memory, output_proposals) =
-            generate_encoder_output_proposals(&memory, height, width);
+        let (proposals, valid) = self.encoder_proposals(
+            memory.size()[0],
+            height,
+            width,
+            memory.kind(),
+            memory.device(),
+        );
+        let output_memory = memory.masked_fill(&valid.logical_not(), 0.0);
+        let output_proposals = proposals.masked_fill(&valid.logical_not(), 0.0);
         let encoder = &self.encoder_groups[0];
         let encoded_memory = encoder
             .output_norm
@@ -647,11 +807,8 @@ impl Transformer {
         let target = query_feat.unsqueeze(0);
         let hs = self
             .decoder
-            .forward(&target, &memory, &position, &references, (height, width));
-        TransformerOutput {
-            hs,
-            references: references.unsqueeze(0),
-        }
+            .forward(&target, &memory, &references, (height, width));
+        TransformerOutput { hs, references }
     }
 }
 
@@ -718,7 +875,6 @@ impl TransformerDecoder {
         &self,
         target: &Tensor,
         memory: &Tensor,
-        position: &Tensor,
         references: &Tensor,
         spatial_shape: (i64, i64),
     ) -> Tensor {
@@ -726,21 +882,20 @@ impl TransformerDecoder {
         let query_position = self.ref_point_head.forward(&sine);
         let reference_points = references.unsqueeze(2);
         let mut output = target.shallow_clone();
-        let mut intermediate = Vec::with_capacity(self.layers.len());
         for layer in &self.layers {
             output = layer.forward(
                 &output,
                 memory,
-                position,
                 &query_position,
                 &reference_points,
                 spatial_shape,
             );
-            intermediate.push(self.norm.forward(&output));
         }
-        intermediate.pop();
-        intermediate.push(self.norm.forward(&output));
-        Tensor::stack(&intermediate, 0)
+        // Upstream's inference path (lwdetr.py) reads only the last of the six
+        // decoder layers' logits, boxes and masks; the earlier layers exist for
+        // the training-time auxiliary losses. Returning the last layer alone is
+        // a structural match to that path, not a numerical approximation.
+        self.norm.forward(&output)
     }
 }
 
@@ -772,7 +927,6 @@ impl TransformerDecoderLayer {
         &self,
         target: &Tensor,
         memory: &Tensor,
-        _position: &Tensor,
         query_position: &Tensor,
         reference_points: &Tensor,
         spatial_shape: (i64, i64),
@@ -949,27 +1103,36 @@ impl MultiscaleDeformableAttention {
     }
 }
 
-fn generate_encoder_output_proposals(memory: &Tensor, height: i64, width: i64) -> (Tensor, Tensor) {
-    let options = (memory.kind(), memory.device());
+/// The encoder's grid proposals and their validity mask, `[batch, height *
+/// width, 4]` and `[batch, height * width, 1]`.
+///
+/// Upstream builds these from the memory grid alone
+/// (`transformer.py:generate_encoder_output_proposals`), never from the memory
+/// values, which is what lets `Transformer::encoder_proposals` cache them.
+fn build_encoder_proposals(
+    batch: i64,
+    height: i64,
+    width: i64,
+    kind: Kind,
+    device: Device,
+) -> (Tensor, Tensor) {
+    let options = (kind, device);
     let grid_y = Tensor::linspace(0.0, (height - 1) as f64, height, options);
     let grid_x = Tensor::linspace(0.0, (width - 1) as f64, width, options);
     let mesh = Tensor::meshgrid_indexing(&[grid_y, grid_x], "ij");
     let grid = Tensor::cat(&[mesh[1].unsqueeze(-1), mesh[0].unsqueeze(-1)], -1);
     let scale = Tensor::from_slice(&[width as f32, height as f32])
-        .to_device(memory.device())
-        .to_kind(memory.kind())
+        .to_device(device)
+        .to_kind(kind)
         .view([1, 1, 2]);
     let grid = (grid.unsqueeze(0) + 0.5) / scale;
     let wh = Tensor::ones_like(&grid) * 0.05;
-    let proposals = Tensor::cat(&[grid, wh], -1).reshape([memory.size()[0], height * width, 4]);
+    let proposals = Tensor::cat(&[grid, wh], -1).reshape([batch, height * width, 4]);
     let valid = proposals
         .gt(0.01)
         .logical_and(&proposals.lt(0.99))
         .all_dim(-1, true);
-    (
-        memory.masked_fill(&valid.logical_not(), 0.0),
-        proposals.masked_fill(&valid.logical_not(), 0.0),
-    )
+    (proposals, valid)
 }
 
 fn gen_sineembed_for_position(position: &Tensor) -> Tensor {
@@ -990,41 +1153,6 @@ fn gen_sineembed_for_position(position: &Tensor) -> Tensor {
         .flatten(2, 3)
     };
     Tensor::cat(&[encode(1), encode(0), encode(2), encode(3)], 2)
-}
-
-fn sine_position_embedding(feature: &Tensor) -> Tensor {
-    let size = feature.size();
-    let batch_size = size[0];
-    let height = size[2];
-    let width = size[3];
-    let options = (feature.kind(), feature.device());
-    let y = Tensor::arange_start(1, height + 1, options)
-        .view([1, height, 1])
-        .expand([batch_size, height, width], false)
-        / (height as f64 + 1e-6)
-        * (2.0 * std::f64::consts::PI);
-    let x = Tensor::arange_start(1, width + 1, options)
-        .view([1, 1, width])
-        .expand([batch_size, height, width], false)
-        / (width as f64 + 1e-6)
-        * (2.0 * std::f64::consts::PI);
-    let dim_t = Tensor::arange(HIDDEN_DIM / 2, options);
-    let exponent = dim_t.floor_divide_scalar(2) * 2.0 / (HIDDEN_DIM / 2) as f64;
-    let dim_t = (exponent * 10000f64.ln()).exp();
-    let encode = |coordinates: Tensor| {
-        let embedded = coordinates.unsqueeze(-1) / &dim_t;
-        Tensor::stack(
-            &[
-                embedded.slice(-1, 0, HIDDEN_DIM / 2, 2).sin(),
-                embedded.slice(-1, 1, HIDDEN_DIM / 2, 2).cos(),
-            ],
-            4,
-        )
-        .flatten(3, 4)
-    };
-    Tensor::cat(&[encode(y), encode(x)], 3)
-        .permute([0, 3, 1, 2])
-        .to_kind(feature.kind())
 }
 
 // https://github.com/roboflow/rf-detr/blob/4ab7c18729de9d02ffd0495795d0831b5630f01b/src/rfdetr/models/heads/segmentation.py
@@ -1061,37 +1189,33 @@ impl SegmentationHead {
         }
     }
 
-    fn forward(
+    /// The mask-projection inputs for this page.
+    ///
+    /// Only the final mask tensor is caller-visible. Running the six spatial
+    /// blocks first and projecting the final query is algebraically identical
+    /// to materializing all six intermediate mask tensors upstream.
+    fn features(
         &self,
         spatial_features: &Tensor,
         query_features: &Tensor,
         image_size: (i64, i64),
-    ) -> Tensor {
+    ) -> MaskFeatures {
         let mut spatial_features = spatial_features.upsample_bilinear2d(
             [image_size.0 / 4, image_size.1 / 4],
             false,
             None,
             None,
         );
-        // Only the final mask tensor is caller-visible. Running the six spatial
-        // blocks first and projecting the final query is algebraically identical
-        // to materializing all six intermediate mask tensors upstream.
         for block in &self.blocks {
             spatial_features = block.forward(&spatial_features);
         }
-        let spatial_features = self.spatial_features_proj.forward(&spatial_features);
-        let query_features = self
-            .query_features_proj
-            .forward(&self.query_features_block.forward(query_features));
-        query_features
-            .matmul(&spatial_features.flatten(2, -1))
-            .view([
-                spatial_features.size()[0],
-                query_features.size()[1],
-                image_size.0 / 4,
-                image_size.1 / 4,
-            ])
-            + &self.bias
+        MaskFeatures {
+            spatial: self.spatial_features_proj.forward(&spatial_features),
+            query: self
+                .query_features_proj
+                .forward(&self.query_features_block.forward(query_features)),
+            bias: self.bias.shallow_clone(),
+        }
     }
 }
 

@@ -13,6 +13,7 @@ mod config;
 mod measure;
 mod model;
 mod processor;
+mod resolution;
 mod suppress;
 
 use anyhow::{Context, Result};
@@ -72,13 +73,10 @@ impl KoharuLayoutRFDetrSeg2XL {
             .await
             .context("failed to resolve KoharuLayout RF-DETR weights")?;
         let config = KoharuLayoutRFDetrSeg2XLConfig::from_file(&config_path)?;
-        anyhow::ensure!(
-            config.resolution == model::RESOLUTION,
-            "the checkpoint's {}-pixel resolution does not match this port's {}",
-            config.resolution,
-            model::RESOLUTION
-        );
-        let processor = KoharuLayoutRFDetrImageProcessor::new(&config)?;
+        // The processor checks the checkpoint's resolution against this port's;
+        // the context keeps the failure readable from this call site.
+        let processor = KoharuLayoutRFDetrImageProcessor::new(&config)
+            .context("the checkpoint config does not match this port")?;
         let thresholds = KoharuLayoutThresholds {
             onomatopoeia: ONOMATOPOEIA_THRESHOLD,
             bubble: BUBBLE_THRESHOLD,
