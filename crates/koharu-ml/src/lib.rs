@@ -1,6 +1,6 @@
 use anyhow::Context;
 use koharu_llama::llama_backend::LlamaBackend;
-use koharu_runtime::{Feature, Hardware, Runtime};
+use koharu_runtime::{DevicePreference, Feature, Hardware, Runtime};
 use tokio::sync::OnceCell;
 
 mod backend;
@@ -44,33 +44,65 @@ static READY: OnceCell<Device> = OnceCell::const_new();
 /// deterministic, single-attempt API.
 #[tracing::instrument(skip_all)]
 pub async fn init() -> anyhow::Result<()> {
-    init_features(vec![Feature::Torch, Feature::Llama, Feature::Diffusion]).await
+    init_features(
+        vec![Feature::Torch, Feature::Llama, Feature::Diffusion],
+        DevicePreference::Any,
+    )
+    .await
 }
 
 /// Initializes only the CPU-capable Torch backend, skipping llama.cpp and
 /// stable-diffusion.cpp. Use for headless servers that translate through
 /// remote providers and inpaint with Torch-only models, so no Vulkan GPU is
 /// required.
+///
+/// The CPU-only preference is what keeps a host with a GPU from installing the
+/// accelerator build of LibTorch, whose CPU operators run without MKL, oneDNN
+/// and OpenMP.
 #[tracing::instrument(skip_all)]
 pub async fn init_cpu() -> anyhow::Result<()> {
-    init_features(vec![Feature::Torch]).await
+    init_features(vec![Feature::Torch], DevicePreference::Cpu).await
 }
 
 /// Initializes Torch + stable-diffusion for iGPU inpainting, skipping
 /// llama.cpp (translation is remote).
 #[tracing::instrument(skip_all)]
 pub async fn init_gpu() -> anyhow::Result<()> {
-    init_features(vec![Feature::Torch, Feature::Diffusion]).await
+    init_features(
+        vec![Feature::Torch, Feature::Diffusion],
+        DevicePreference::Any,
+    )
+    .await
 }
 
-async fn init_features(features: Vec<Feature>) -> anyhow::Result<()> {
+async fn init_features(features: Vec<Feature>, preference: DevicePreference) -> anyhow::Result<()> {
     READY
         .get_or_try_init(move || async move {
-            let runtime = Runtime::discover(features.iter().copied())?;
+            let runtime = Runtime::discover_with(features.iter().copied(), preference)?;
             let device = runtime
                 .initialize()
                 .await
                 .context("failed to initialize runtimes")?;
+
+            if features.contains(&Feature::Torch) {
+                // Torch's thread settings are process-wide and
+                // `set_num_interop_threads` may only be called before any
+                // parallel region runs; torch aborts on a second call after
+                // that. The `READY.get_or_try_init` closure above runs this
+                // block at most once per process, which is what makes the
+                // unconditional call safe. Interop stays at one thread because
+                // every model here issues its work from one thread already;
+                // intra-op parallelism is what the operators use.
+                koharu_torch::set_num_interop_threads(1);
+                if let Some(threads) = std::env::var("KOHARU_TORCH_THREADS")
+                    .ok()
+                    .or_else(|| std::env::var("OMP_NUM_THREADS").ok())
+                    .and_then(|value| value.parse::<i32>().ok())
+                    .filter(|&count| count > 0)
+                {
+                    koharu_torch::set_num_threads(threads);
+                }
+            }
 
             if features.contains(&Feature::Llama) {
                 LLAMA

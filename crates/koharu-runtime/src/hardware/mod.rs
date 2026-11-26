@@ -82,6 +82,17 @@ impl Hardware {
         }
     }
 
+    /// This host planned for its CPU alone: no accelerator is selected, so
+    /// `device()` is `None` and every `supports_*` answers false, whatever the
+    /// probe found.
+    #[must_use]
+    pub(crate) fn cpu_only(&self) -> Self {
+        Self {
+            selected: None,
+            ..self.clone()
+        }
+    }
+
     #[must_use]
     pub fn device(&self) -> Option<&Device> {
         self.selected.and_then(|index| self.devices.get(index))

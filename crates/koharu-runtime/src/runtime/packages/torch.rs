@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use strum::EnumProperty;
 
 use crate::{
-    Hardware, Store, download,
+    DevicePreference, Hardware, Store, download,
     runtime::{
         DiscoverablePackage, Package, RuntimePackage, graph::Component, loader, packages::Cuda,
         sealed,
@@ -113,7 +113,13 @@ impl Package for Torch {
 }
 
 impl DiscoverablePackage for Torch {
-    fn discover(hardware: &Hardware) -> Option<Self> {
+    fn discover(hardware: &Hardware, preference: DevicePreference) -> Option<Self> {
+        // The CPU build is the only one with MKL, oneDNN and OpenMP; the
+        // accelerator builds turn all three off, so a caller that runs on the
+        // CPU must get it even on a host that has a GPU.
+        if preference == DevicePreference::Cpu {
+            return Some(Self::Cpu);
+        }
         if hardware.supports_metal() {
             return Some(Self::Cpu);
         }

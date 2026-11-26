@@ -6,8 +6,8 @@ use strum::EnumProperty;
 use crate::{
     Hardware, Store, download,
     runtime::{
-        DiscoverablePackage, Package, RuntimePackage, graph::Component, loader, packages::Cuda,
-        sealed,
+        DevicePreference, DiscoverablePackage, Package, RuntimePackage, graph::Component, loader,
+        packages::Cuda, sealed,
     },
     source::extract,
 };
@@ -122,7 +122,7 @@ impl Package for Llama {
 }
 
 impl DiscoverablePackage for Llama {
-    fn discover(hardware: &Hardware) -> Option<Self> {
+    fn discover(hardware: &Hardware, _preference: DevicePreference) -> Option<Self> {
         if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
             if hardware.supports_cuda() {
                 return Some(Self::WindowsCuda);

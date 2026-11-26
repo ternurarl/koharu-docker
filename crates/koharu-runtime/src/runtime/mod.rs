@@ -37,7 +37,18 @@ pub(crate) trait RuntimePackage: Package + std::fmt::Debug + Eq + Hash {
 }
 
 pub(crate) trait DiscoverablePackage: RuntimePackage {
-    fn discover(hardware: &Hardware) -> Option<Self>;
+    fn discover(hardware: &Hardware, preference: DevicePreference) -> Option<Self>;
+}
+
+/// Which devices a runtime plan may install packages for.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DevicePreference {
+    /// Whatever the host offers, best candidate first.
+    Any,
+    /// The CPU alone, whatever accelerators the host has. The accelerator
+    /// builds of some packages leave out what their CPU paths need, so a caller
+    /// that runs on the CPU must not be given one of them.
+    Cpu,
 }
 
 /// A process-wide runtime capability requested by a consumer.
@@ -56,11 +67,24 @@ pub struct Runtime {
 }
 
 impl Runtime {
+    /// Plans for the best device the host offers.
     pub fn discover(features: impl IntoIterator<Item = Feature>) -> Result<Self> {
+        Self::discover_with(features, DevicePreference::Any)
+    }
+
+    /// Plans for `preference`: either the host's best device or the CPU alone.
+    pub fn discover_with(
+        features: impl IntoIterator<Item = Feature>,
+        preference: DevicePreference,
+    ) -> Result<Self> {
         let features = features.into_iter().collect::<Vec<_>>();
         let hardware = Hardware::discover();
-        for candidate in hardware.candidates() {
-            if let Some(plan) = Self::plan(&features, &candidate)? {
+        let candidates = match preference {
+            DevicePreference::Any => hardware.candidates().collect::<Vec<_>>(),
+            DevicePreference::Cpu => vec![hardware.cpu_only()],
+        };
+        for candidate in candidates {
+            if let Some(plan) = Self::plan(&features, &candidate, preference)? {
                 return Ok(Self {
                     plan,
                     hardware: candidate,
@@ -70,15 +94,19 @@ impl Runtime {
         anyhow::bail!("no device supports the requested runtime features")
     }
 
-    fn plan(features: &[Feature], hardware: &Hardware) -> Result<Option<Plan>> {
+    fn plan(
+        features: &[Feature],
+        hardware: &Hardware,
+        preference: DevicePreference,
+    ) -> Result<Option<Plan>> {
         let mut plan = Plan::default();
         let mut previous = None;
 
         for feature in features {
             let Some(node) = (match feature {
-                Feature::Torch => plan.require::<Torch>(hardware)?,
-                Feature::Llama => plan.require::<Llama>(hardware)?,
-                Feature::Diffusion => plan.require::<Diffusion>(hardware)?,
+                Feature::Torch => plan.require::<Torch>(hardware, preference)?,
+                Feature::Llama => plan.require::<Llama>(hardware, preference)?,
+                Feature::Diffusion => plan.require::<Diffusion>(hardware, preference)?,
             }) else {
                 return Ok(None);
             };

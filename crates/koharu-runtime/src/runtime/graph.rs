@@ -9,7 +9,7 @@ use petgraph::{
 use crate::{
     Device, Hardware,
     runtime::{
-        DiscoverablePackage, RuntimePackage,
+        DevicePreference, DiscoverablePackage, RuntimePackage,
         packages::{Cuda, Diffusion, Llama, Rocm, Torch},
     },
 };
@@ -100,12 +100,16 @@ pub(crate) struct Plan {
 }
 
 impl Plan {
-    pub(crate) fn require<P>(&mut self, hardware: &Hardware) -> Result<Option<NodeIndex>>
+    pub(crate) fn require<P>(
+        &mut self,
+        hardware: &Hardware,
+        preference: DevicePreference,
+    ) -> Result<Option<NodeIndex>>
     where
         P: DiscoverablePackage,
         Component: From<P>,
     {
-        P::discover(hardware)
+        P::discover(hardware, preference)
             .map(|package| self.insert(package.into(), hardware))
             .transpose()
     }
