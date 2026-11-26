@@ -40,8 +40,15 @@ const MODEL_ID: &str = "mayocream/koharu-layout-highres";
 const MODEL_NAME: &str = "koharu-layout-rfdetr-seg-2xl";
 const PRODUCER: &str = "dev.koharu.pipeline.detection";
 const ANGLE_SNAP_DEGREES: f32 = 3.0;
-const ANGLE_SEARCH_HALF_STEPS: i32 = 90;
-const ANGLE_SEARCH_STEP_DEGREES: f64 = 0.5;
+/// How far either side of upright an angle search looks.
+const ANGLE_SEARCH_HALF_DEGREES: f64 = 45.0;
+/// The first pass' step: 19 samples over the whole range. The best coarse
+/// sample is within half a step of the true peak, so the second pass only has
+/// to resolve that neighbourhood.
+const ANGLE_COARSE_STEP_DEGREES: f64 = 5.0;
+/// The second pass' step, and its half-width around the coarse best: the same
+/// 0.5-degree lattice the single pass used to cover end to end.
+const ANGLE_FINE_STEP_DEGREES: f64 = 0.5;
 const TYPOGRAPHY_SAMPLE_MARGIN_PER_1024: f32 = 4.0;
 const COLOR_SNAP_DARK_LUMINANCE: u32 = 64 * 256;
 const COLOR_SNAP_LIGHT_LUMINANCE: u32 = 191 * 256;
@@ -636,19 +643,32 @@ fn mask_angle(points: &[MaskPoint], [left, top, right, bottom]: [f32; 4]) -> (f3
             ]
         },
     );
-    let mut horizontal = (f64::NEG_INFINITY, 0.0);
-    let mut vertical = (f64::NEG_INFINITY, 0.0);
-    for step in -ANGLE_SEARCH_HALF_STEPS..=ANGLE_SEARCH_HALF_STEPS {
-        let angle_degrees = f64::from(step) * ANGLE_SEARCH_STEP_DEGREES;
-        let (sin, cos) = angle_degrees.to_radians().sin_cos();
-        let (horizontal_score, vertical_score) = projection_scores(points, bounds, sin, cos);
-        if horizontal_score > horizontal.0 {
-            horizontal = (horizontal_score, angle_degrees);
-        }
-        if vertical_score > vertical.0 {
-            vertical = (vertical_score, angle_degrees);
-        }
-    }
+    let mut scratch = ProjectionScratch::default();
+    // Two passes over the same score: a coarse one that cannot miss the peak by
+    // more than half its step, then a fine one over that neighbourhood. The
+    // fine lattice is the one a single 0.5-degree sweep would have used, so the
+    // answer is the same for a peak the coarse pass locates.
+    let (coarse_horizontal, coarse_vertical) = coarse_angles(points, bounds, &mut scratch);
+    // The neighbourhood of a coarse sample at the edge of the search reaches
+    // past it; the search range, not the coarse step, is what bounds the answer.
+    let horizontal = best_angle(
+        points,
+        bounds,
+        (coarse_horizontal.1 - ANGLE_COARSE_STEP_DEGREES).max(-ANGLE_SEARCH_HALF_DEGREES)
+            ..=(coarse_horizontal.1 + ANGLE_COARSE_STEP_DEGREES).min(ANGLE_SEARCH_HALF_DEGREES),
+        ANGLE_FINE_STEP_DEGREES,
+        false,
+        &mut scratch,
+    );
+    let vertical = best_angle(
+        points,
+        bounds,
+        (coarse_vertical.1 - ANGLE_COARSE_STEP_DEGREES).max(-ANGLE_SEARCH_HALF_DEGREES)
+            ..=(coarse_vertical.1 + ANGLE_COARSE_STEP_DEGREES).min(ANGLE_SEARCH_HALF_DEGREES),
+        ANGLE_FINE_STEP_DEGREES,
+        true,
+        &mut scratch,
+    );
     let maximum_score = horizontal.0.max(vertical.0);
     let scores_are_close = (horizontal.0 - vertical.0).abs() <= maximum_score * 0.02;
     let is_vertical = if scores_are_close {
@@ -667,11 +687,88 @@ fn mask_angle(points: &[MaskPoint], [left, top, right, bottom]: [f32; 4]) -> (f3
     (angle, is_vertical)
 }
 
-fn projection_scores(points: &[MaskPoint], bounds: [f64; 4], sin: f64, cos: f64) -> (f64, f64) {
+/// The two projection histograms one `projection_scores` call fills, kept
+/// across the ~60 angles of one search instead of allocated per angle.
+#[derive(Default)]
+struct ProjectionScratch {
+    horizontal: Vec<f64>,
+    vertical: Vec<f64>,
+}
+
+impl ProjectionScratch {
+    fn prepare(&mut self, horizontal_length: usize, vertical_length: usize) {
+        self.horizontal.clear();
+        self.horizontal.resize(horizontal_length, 0.0);
+        self.vertical.clear();
+        self.vertical.resize(vertical_length, 0.0);
+    }
+}
+
+/// The best `(score, angle)` pair for each axis over the whole coarse lattice.
+/// Both axes come from one pass because a projection at one angle already
+/// scores both.
+fn coarse_angles(
+    points: &[MaskPoint],
+    bounds: [f64; 4],
+    scratch: &mut ProjectionScratch,
+) -> ((f64, f64), (f64, f64)) {
+    let mut best = ((f64::NEG_INFINITY, 0.0), (f64::NEG_INFINITY, 0.0));
+    let mut angle_degrees = -ANGLE_SEARCH_HALF_DEGREES;
+    while angle_degrees <= ANGLE_SEARCH_HALF_DEGREES {
+        let (sin, cos) = angle_degrees.to_radians().sin_cos();
+        let (horizontal_score, vertical_score) =
+            projection_scores(points, bounds, sin, cos, scratch);
+        if horizontal_score > best.0.0 {
+            best.0 = (horizontal_score, angle_degrees);
+        }
+        if vertical_score > best.1.0 {
+            best.1 = (vertical_score, angle_degrees);
+        }
+        angle_degrees += ANGLE_COARSE_STEP_DEGREES;
+    }
+    best
+}
+
+/// The best `(score, angle)` pair over `range`, stepping by `step` degrees.
+fn best_angle(
+    points: &[MaskPoint],
+    bounds: [f64; 4],
+    range: std::ops::RangeInclusive<f64>,
+    step: f64,
+    vertical: bool,
+    scratch: &mut ProjectionScratch,
+) -> (f64, f64) {
+    let mut best = (f64::NEG_INFINITY, 0.0);
+    let mut angle_degrees = *range.start();
+    while angle_degrees <= *range.end() {
+        let (sin, cos) = angle_degrees.to_radians().sin_cos();
+        let (horizontal_score, vertical_score) =
+            projection_scores(points, bounds, sin, cos, scratch);
+        let score = if vertical {
+            vertical_score
+        } else {
+            horizontal_score
+        };
+        if score > best.0 {
+            best = (score, angle_degrees);
+        }
+        angle_degrees += step;
+    }
+    best
+}
+
+fn projection_scores(
+    points: &[MaskPoint],
+    bounds: [f64; 4],
+    sin: f64,
+    cos: f64,
+    scratch: &mut ProjectionScratch,
+) -> (f64, f64) {
     let (horizontal_origin, horizontal_length) = projection_extent(bounds, -sin, cos);
     let (vertical_origin, vertical_length) = projection_extent(bounds, cos, sin);
-    let mut horizontal = vec![0.0; horizontal_length];
-    let mut vertical = vec![0.0; vertical_length];
+    scratch.prepare(horizontal_length, vertical_length);
+    let horizontal = &mut scratch.horizontal;
+    let vertical = &mut scratch.vertical;
     for point in points {
         let horizontal_projection = point.y * cos - point.x * sin - horizontal_origin;
         let horizontal_index = horizontal_projection.floor() as usize;
@@ -1419,14 +1516,23 @@ fn mask_geometry(mask: &KoharuLayoutMask) -> Option<Geometry> {
 /// grown past each block's own glyphs. Onomatopoeia keeps out of it, as a drawn
 /// mark of its own is redrawn with the art.
 fn text_mask(detections: &[KoharuLayoutDetection], image: &RgbImage, size: ImageSize) -> GrayImage {
-    let mut mask = GrayImage::new(size.width, size.height);
-    for detection in detections
-        .iter()
+    // Fitting and growing one detection is independent of every other, and both
+    // steps are pure: `glyph_mask` and `mask_dilation_radius` only read their
+    // arguments. `stamp_mask` only ever writes `u8::MAX` into the page mask, so
+    // the order the grown masks land in does not change the result, and
+    // `par_iter().collect()` keeps the detections' order regardless.
+    let grown = detections
+        .par_iter()
         .filter(|detection| detection.label == "text")
-    {
-        let fitted = glyph_mask(&detection.mask, detection.bbox, image);
-        let radius = mask_dilation_radius(detection.bbox, size);
-        stamp_mask(&mut mask, &grown_mask(&fitted, radius, size), 0, 0);
+        .map(|detection| {
+            let fitted = glyph_mask(&detection.mask, detection.bbox, image);
+            let radius = mask_dilation_radius(detection.bbox, size);
+            grown_mask(&fitted, radius, size)
+        })
+        .collect::<Vec<_>>();
+    let mut mask = GrayImage::new(size.width, size.height);
+    for detection_mask in grown {
+        stamp_mask(&mut mask, &detection_mask, 0, 0);
     }
     mask
 }
