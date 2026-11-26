@@ -76,6 +76,13 @@ COPY . .
 ARG RUSTFLAGS="-C target-cpu=x86-64-v3"
 ENV RUSTFLAGS=${RUSTFLAGS}
 
+# Concurrent rustc jobs. Unset keeps cargo's default (one per core), which is
+# what a build host with memory to spare wants; a host that would swap passes a
+# number, for example --build-arg CARGO_BUILD_JOBS=2. It reaches cargo as `-j`
+# only when set, because cargo rejects an empty CARGO_BUILD_JOBS instead of
+# treating it as unset.
+ARG CARGO_BUILD_JOBS
+
 # Frontend build is intentionally skipped: the headless feature does not
 # embed a frontend (no tauri-build / generate_context!).
 
@@ -86,7 +93,9 @@ RUN --mount=type=cache,target=/root/.cache/koharu \
     --mount=type=cache,target=/opt/cargo/registry \
     --mount=type=cache,target=/app/target \
     cargo build -p koharu --release --locked --no-default-features --features headless \
+        ${CARGO_BUILD_JOBS:+-j ${CARGO_BUILD_JOBS}} \
     && cargo build -p koharu-pipeline --release --locked --bin pipeline-task \
+        ${CARGO_BUILD_JOBS:+-j ${CARGO_BUILD_JOBS}} \
     && mkdir -p /out \
     && cp /app/target/release/koharu /out/koharu \
     && cp /app/target/release/pipeline-task /out/pipeline-task
